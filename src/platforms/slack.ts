@@ -26,6 +26,7 @@ import type {
   McplContentBlock,
   McplContextInjection,
   McplTextContent,
+  ChannelsAcknowledgeResult,
 } from '../mcpl/types.js';
 import type { PlatformAdapter, PublishResult, RoutingHints, OnIncomingMessage } from './adapter.js';
 import { formatSlackText, extractSlackUserIds, resolveSlackUserNames, type AttachmentRef } from '../content.js';
@@ -130,6 +131,61 @@ export class SlackAdapter implements PlatformAdapter {
     });
 
     return { delivered: true, messageId: result.ts ? String(result.ts) : undefined };
+  }
+
+  async fetchHistory(
+    channelId: string,
+    _descriptor: ChannelDescriptor,
+    limit: number,
+    beforeMessageId?: string,
+  ): Promise<ChannelIncomingMessage[]> {
+    const conversationId = channelId.slice('slack:'.length);
+    const result = await this.web.conversations.history({
+      channel: conversationId,
+      limit: Math.min(limit, 200),
+      ...(beforeMessageId ? { latest: beforeMessageId, inclusive: false } : {}),
+    });
+    const messages = (result.messages ?? []).slice().reverse();
+    const ids = new Set<string>();
+    for (const message of messages) {
+      if (message.user) ids.add(message.user);
+      for (const id of extractSlackUserIds(message.text ?? '')) ids.add(id);
+    }
+    await this.resolveUserNames(Array.from(ids));
+    return messages.map((message) => ({
+      channelId,
+      messageId: String(message.ts),
+      ...(message.thread_ts ? { threadId: message.thread_ts } : {}),
+      author: {
+        id: message.user ?? 'bot',
+        name: message.user
+          ? (this.userNameCache.get(message.user) ?? message.user)
+          : (message.username ?? 'bot'),
+      },
+      timestamp: new Date(parseFloat(message.ts ?? '0') * 1000).toISOString(),
+      content: [{ type: 'text', text: formatSlackText(message.text ?? '', this.userNameCache) }],
+      metadata: { thread_ts: message.thread_ts, backscroll: true },
+    }));
+  }
+
+  async acknowledge(
+    channelId: string,
+    _descriptor: ChannelDescriptor,
+    messageId: string,
+    value?: string,
+  ): Promise<ChannelsAcknowledgeResult> {
+    const representation = value?.trim() || '👀';
+    const name = representation === '👀' ? 'eyes' : representation.replace(/:/g, '');
+    try {
+      await this.web.reactions.add({
+        channel: channelId.slice('slack:'.length),
+        timestamp: messageId,
+        name,
+      });
+      return { acknowledged: true, representation };
+    } catch (error) {
+      return { acknowledged: false, reason: (error as Error).message };
+    }
   }
 
   async fetchContext(

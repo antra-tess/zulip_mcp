@@ -16,13 +16,25 @@ import type {
   ChannelIncomingMessage,
   ChannelsPublishParams,
   ChannelsOpenParams,
+  ChannelsOpenResult,
   ChannelsCloseParams,
+  ChannelsCloseResult,
+  ChannelsAcknowledgeParams,
+  ChannelsAcknowledgeResult,
   ChannelsListResult,
 } from './types.js';
 import type { McplClient } from './client.js';
 import type { PlatformAdapter, PlatformSystemEvent, RoutingHints } from '../platforms/adapter.js';
 
 const DEFAULT_BATCH_WINDOW_MS = 500;
+const DEFAULT_MAX_HISTORY = 200;
+
+export interface ChannelManagerOptions {
+  /** Legacy file-backed monitoring state, used only as a Chronicle bootstrap. */
+  initiallyOpen?: ReadonlySet<string>;
+  /** Called only after the host acknowledges the initial channels/register. */
+  onInitialRegistrationAcknowledged?: (registeredChannelIds: ReadonlySet<string>) => void;
+}
 
 export class ChannelManager {
   private allChannels = new Map<string, ChannelDescriptor>();
@@ -38,6 +50,7 @@ export class ChannelManager {
     private mcplClient: McplClient,
     private adapters: Map<string, PlatformAdapter>,
     batchWindowMs?: number,
+    private options: ChannelManagerOptions = {},
   ) {
     this.batchWindowMs = batchWindowMs ?? DEFAULT_BATCH_WINDOW_MS;
   }
@@ -51,7 +64,19 @@ export class ChannelManager {
     for (const adapter of this.adapters.values()) {
       try {
         const discovered = await adapter.discoverChannels();
-        for (const descriptor of discovered) {
+        for (const raw of discovered) {
+          const descriptor: ChannelDescriptor = {
+            ...raw,
+            initiallyOpen: this.options.initiallyOpen?.has(raw.id) === true,
+            capabilities: {
+              ...(adapter.fetchHistory ? {
+                history: { maxMessages: DEFAULT_MAX_HISTORY, supportsBeforeMessage: true },
+              } : {}),
+              ...(adapter.acknowledge ? {
+                acknowledgment: { kind: 'reaction', supportsValue: true },
+              } : {}),
+            },
+          };
           channels.push(descriptor);
           this.allChannels.set(descriptor.id, descriptor);
         }
@@ -63,9 +88,13 @@ export class ChannelManager {
     if (channels.length > 0) {
       try {
         await this.mcplClient.registerChannels(channels);
+        this.options.onInitialRegistrationAcknowledged?.(
+          new Set(channels.map((channel) => channel.id)),
+        );
         console.error(`Registered ${channels.length} channels with host`);
       } catch (error) {
         console.error('Failed to register channels:', error);
+        throw error;
       }
     }
   }
@@ -73,27 +102,57 @@ export class ChannelManager {
   /**
    * Handle channels/open from the host.
    */
-  openChannel(params: ChannelsOpenParams): { channel: ChannelDescriptor } {
-    // Find channel by type and address
-    for (const [id, descriptor] of this.allChannels) {
-      if (descriptor.type === params.type) {
-        const matchesAddress = !params.address ||
-          Object.entries(params.address).every(([k, v]) => descriptor.address?.[k] === v);
-        if (matchesAddress) {
-          this.openChannels.add(id);
-          return { channel: descriptor };
-        }
-      }
+  async openChannel(params: ChannelsOpenParams): Promise<ChannelsOpenResult> {
+    const exact = params.channelId ? this.allChannels.get(params.channelId) : undefined;
+    const descriptor = exact ?? Array.from(this.allChannels.values()).find((candidate) => {
+      if (candidate.type !== params.type) return false;
+      return !params.address ||
+        Object.entries(params.address).every(([k, v]) => candidate.address?.[k] === v);
+    });
+    if (!descriptor) throw new Error(`No channel found matching type=${params.type}`);
+
+    const adapter = this.adapterFor(descriptor.id);
+    if (!adapter) throw new Error(`No adapter for channel ${descriptor.id}`);
+    const result: ChannelsOpenResult = { channel: descriptor };
+    const requested = params.history?.limit ?? 0;
+    if (requested > 0 && adapter.fetchHistory) {
+      const limit = Math.min(DEFAULT_MAX_HISTORY, Math.max(0, Math.floor(requested)));
+      result.history = await adapter.fetchHistory(
+        descriptor.id,
+        descriptor,
+        limit,
+        params.history?.beforeMessageId,
+      );
+      result.historyTruncated = requested > limit;
     }
-    throw new Error(`No channel found matching type=${params.type}`);
+
+    // History and platform subscription are atomic from the host's point of
+    // view: do not mark open if either operation fails.
+    await adapter.openChannel?.(descriptor.id, descriptor);
+    this.openChannels.add(descriptor.id);
+    return result;
   }
 
   /**
    * Handle channels/close from the host.
    */
-  closeChannel(params: ChannelsCloseParams): { closed: boolean } {
-    const existed = this.openChannels.delete(params.channelId);
-    return { closed: existed };
+  async closeChannel(params: ChannelsCloseParams): Promise<ChannelsCloseResult> {
+    const descriptor = this.allChannels.get(params.channelId);
+    if (!descriptor) return { closed: false };
+    const adapter = this.adapterFor(params.channelId);
+    await adapter?.closeChannel?.(params.channelId, descriptor);
+    this.openChannels.delete(params.channelId);
+    return { closed: true };
+  }
+
+  async acknowledge(params: ChannelsAcknowledgeParams): Promise<ChannelsAcknowledgeResult> {
+    const descriptor = this.allChannels.get(params.channelId);
+    if (!descriptor) return { acknowledged: false, reason: `Unknown channel ${params.channelId}` };
+    const adapter = this.adapterFor(params.channelId);
+    if (!adapter?.acknowledge) {
+      return { acknowledged: false, reason: `Acknowledgment is not supported for ${descriptor.type}` };
+    }
+    return adapter.acknowledge(params.channelId, descriptor, params.messageId, params.value);
   }
 
   /**
@@ -108,7 +167,10 @@ export class ChannelManager {
    * Buffers messages and flushes in batches.
    */
   onIncomingMessage(channelId: string, message: ChannelIncomingMessage): void {
-    if (!this.openChannels.has(channelId)) return; // channel not opened by host
+    if (!this.openChannels.has(channelId)) {
+      this.pushClosedAddressedMessage(channelId, message);
+      return;
+    }
 
     // Remember where the conversation is, so publishes reply in-thread.
     this.lastIncoming.set(channelId, {
@@ -236,6 +298,45 @@ export class ChannelManager {
     buffer.push(message);
 
     this.scheduleBatchFlush();
+  }
+
+  private pushClosedAddressedMessage(channelId: string, message: ChannelIncomingMessage): void {
+    const metadata = message.metadata ?? {};
+    const isDM = metadata.isDM === true || metadata.channel_type === 'im';
+    const isMention = metadata.mentioned === true;
+    const isReplyToBot = metadata.isReplyToBot === true;
+    if (!isDM && !isMention && !isReplyToBot) return;
+
+    const tags = [
+      'chat:addressed',
+      ...(isMention ? ['chat:mention'] : []),
+      ...(isReplyToBot ? ['chat:reply'] : []),
+      ...(isDM ? ['chat:dm'] : []),
+      'chat:from-human',
+    ];
+    void this.mcplClient.sendPushEvent({
+      featureSet: `${this.adapterFor(channelId)?.type ?? 'unknown'}.messaging`,
+      eventId: `${channelId}:${message.messageId}`,
+      timestamp: message.timestamp,
+      origin: {
+        source: this.adapterFor(channelId)?.type ?? 'unknown',
+        channelId,
+        mcplChannelId: channelId,
+        messageId: message.messageId,
+        threadId: message.threadId,
+        authorId: message.author.id,
+        authorName: message.author.name,
+        isMention: isMention || isReplyToBot,
+        isExplicitMention: isMention,
+        isReplyToBot,
+        isBot: false,
+        isDM,
+      },
+      tags,
+      payload: { content: message.content },
+    }).catch((error) => {
+      console.error(`Failed to send closed-channel ping ${channelId}/${message.messageId}:`, error);
+    });
   }
 
   private scheduleBatchFlush(): void {

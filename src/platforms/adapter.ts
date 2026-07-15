@@ -17,6 +17,7 @@
 import type {
   ChannelDescriptor,
   ChannelIncomingMessage,
+  ChannelsAcknowledgeResult,
   McplContentBlock,
   McplContextInjection,
 } from '../mcpl/types.js';
@@ -70,6 +71,28 @@ export interface PlatformAdapter {
 
   /** Discover all channels visible to this connection. */
   discoverChannels(): Promise<ChannelDescriptor[]>;
+
+  /** Commit/retire the platform-side subscription corresponding to host
+   *  channel lifecycle. Optional for platforms such as Slack where Socket
+   *  Mode membership is managed outside this process. */
+  openChannel?(channelId: string, descriptor: ChannelDescriptor): Promise<void>;
+  closeChannel?(channelId: string, descriptor: ChannelDescriptor): Promise<void>;
+
+  /** Atomic backscroll returned with channels/open, oldest first. */
+  fetchHistory?(
+    channelId: string,
+    descriptor: ChannelDescriptor,
+    limit: number,
+    beforeMessageId?: string,
+  ): Promise<ChannelIncomingMessage[]>;
+
+  /** Optional visible acknowledgment for a closed-channel ping. */
+  acknowledge?(
+    channelId: string,
+    descriptor: ChannelDescriptor,
+    messageId: string,
+    value?: string,
+  ): Promise<ChannelsAcknowledgeResult>;
 
   /**
    * Deliver content to a channel. `descriptor` is the registered descriptor

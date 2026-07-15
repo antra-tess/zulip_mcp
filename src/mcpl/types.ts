@@ -102,6 +102,17 @@ export interface ChannelDescriptor {
   direction: 'outbound' | 'inbound' | 'bidirectional';
   address?: Record<string, unknown>;
   metadata?: Record<string, unknown>;
+  /** One-time server bootstrap preference. The host consults this only when
+   *  Chronicle has no desired state for the channel. */
+  initiallyOpen?: boolean;
+  capabilities?: {
+    history?: {
+      maxMessages?: number;
+      supportsBeforeMessage?: boolean;
+      supportsSinceLastSeen?: boolean;
+    };
+    acknowledgment?: { kind?: string; supportsValue?: boolean };
+  };
 }
 
 export interface ChannelIncomingMessage {
@@ -112,6 +123,7 @@ export interface ChannelIncomingMessage {
   timestamp: string;
   content: McplContentBlock[];
   metadata?: Record<string, unknown>;
+  tags?: string[];
 }
 
 export interface ChannelsRegisterParams {
@@ -133,12 +145,50 @@ export interface ChannelsListResult {
 }
 
 export interface ChannelsOpenParams {
+  channelId?: string;
   type: string;
   address?: Record<string, unknown>;
+  history?: {
+    limit: number;
+    beforeMessageId?: string;
+    sinceLastSeen?: boolean;
+  };
 }
 
 export interface ChannelsCloseParams {
   channelId: string;
+}
+
+export interface ChannelsOpenResult {
+  channel: ChannelDescriptor;
+  history?: ChannelIncomingMessage[];
+  historyTruncated?: boolean;
+}
+
+export interface ChannelsCloseResult {
+  closed: boolean;
+}
+
+export interface ChannelsAcknowledgeParams {
+  channelId: string;
+  messageId: string;
+  intent: string;
+  value?: string;
+}
+
+export interface ChannelsAcknowledgeResult {
+  acknowledged: boolean;
+  representation?: string;
+  reason?: string;
+}
+
+export interface PushEventParams {
+  featureSet: string;
+  eventId: string;
+  timestamp: string;
+  origin: Record<string, unknown>;
+  tags?: string[];
+  payload: { content: McplContentBlock[] };
 }
 
 // ============================================================================
@@ -190,6 +240,7 @@ export const McplMethod = {
   ChannelsList: 'channels/list',
   ChannelsOpen: 'channels/open',
   ChannelsClose: 'channels/close',
+  ChannelsAcknowledge: 'channels/acknowledge',
   ChannelsPublish: 'channels/publish',
   ChannelsIncoming: 'channels/incoming',
   ChannelsTyping: 'channels/typing',

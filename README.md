@@ -116,6 +116,20 @@ You can enable any combination:
 
 **Note:** Tools are dynamically loaded based on enabled services. If a service isn't configured, its tools won't appear in the tool list.
 
+### Connectome / MCPL channel lifecycle
+
+When the client negotiates MCPL, the host owns channel lifecycle in Chronicle:
+
+- `channel_open` opens Zulip/Slack delivery and can atomically request up to 200 messages of backscroll.
+- `channel_close` stops ambient delivery.
+- A direct mention or Slack DM in a closed channel is still sent through the host's wake gate, with the exact channel ID, so the agent can open it or decline with an optional reaction acknowledgment.
+- Existing file-backed monitored channels and `ZULIP_SUBSCRIBE` values are advertised once as `initiallyOpen`. After `channels/register` is acknowledged, registered file entries are removed and Chronicle is authoritative.
+- The legacy monitoring/listen tools and monitoring resources are hidden in MCPL mode, avoiding two competing lifecycle controls.
+
+For Zulip, closing a public channel also removes the bot's Zulip subscription; the `all_public_streams` queue still permits closed-channel mentions to be observed. Private-channel membership is retained when closed because Zulip cannot deliver events after private access is removed. Slack channel membership remains an administrator/workspace concern; MCPL open/close controls delivery inside this server.
+
+Ordinary MCP clients do not negotiate MCPL, so their existing monitoring tools, resources, automatic history monitoring, and file persistence remain unchanged.
+
 ### Authentication
 
 #### Zulip Authentication

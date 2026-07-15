@@ -12,6 +12,7 @@ import type {
   ChannelIncomingMessage,
   ChannelsRegisterParams,
   ChannelsIncomingParams,
+  PushEventParams,
 } from './types.js';
 import { McplMethod } from './types.js';
 
@@ -79,6 +80,11 @@ export class McplClient {
   sendIncoming(messages: ChannelIncomingMessage[]): Promise<unknown> {
     const params: ChannelsIncomingParams = { messages };
     return this.request(McplMethod.ChannelsIncoming, params as unknown as Record<string, unknown>);
+  }
+
+  /** Send a gated event for an addressed message in a closed channel. */
+  sendPushEvent(event: PushEventParams): Promise<unknown> {
+    return this.request(McplMethod.PushEvent, event as unknown as Record<string, unknown>);
   }
 
   /**
