@@ -20,7 +20,14 @@ import { ChannelManager } from './mcpl/channels.js';
 import { ContextProvider } from './mcpl/context.js';
 import { buildServerCapabilities } from './mcpl/feature-sets.js';
 import { McplMethod } from './mcpl/types.js';
-import type { ChannelsPublishParams, ChannelsOpenParams, ChannelsCloseParams, BeforeInferenceParams, FeatureSetsUpdateParams } from './mcpl/types.js';
+import type {
+  ChannelsPublishParams,
+  ChannelsOpenParams,
+  ChannelsCloseParams,
+  ChannelsAcknowledgeParams,
+  BeforeInferenceParams,
+  FeatureSetsUpdateParams,
+} from './mcpl/types.js';
 
 // Platform adapters
 import type { PlatformAdapter } from './platforms/adapter.js';
@@ -55,6 +62,16 @@ const ENABLE_SLACK = process.env.ENABLE_SLACK === "true";
 const MCPL_ENABLED = process.env.MCPL_ENABLED !== "false";
 const MCPL_BATCH_WINDOW_MS = parseInt(process.env.MCPL_BATCH_WINDOW_MS || "500", 10);
 const MCPL_CONTEXT_HISTORY_SIZE = parseInt(process.env.MCPL_CONTEXT_HISTORY_SIZE || "20", 10);
+const LEGACY_LIFECYCLE_TOOLS = new Set([
+  'start_monitoring', 'stop_monitoring', 'get_monitored_channels', 'listen', 'unlisten',
+  'discord_start_monitoring', 'discord_stop_monitoring', 'discord_get_monitored_channels',
+  'slack_start_monitoring', 'slack_stop_monitoring', 'slack_get_monitored_channels',
+]);
+let activeMcplTransport: McplTransport | null = null;
+
+function hostOwnsChannelLifecycle(): boolean {
+  return MCPL_ENABLED && activeMcplTransport?.getHostCapabilities() != null;
+}
 
 // Initialize clients
 let zulipClient: any = null;
@@ -163,6 +180,34 @@ function saveState(): void {
   }
 }
 
+/** File-backed monitoring state predates generic MCPL channel lifecycle. In
+ * MCPL mode it is only a one-time bootstrap into the host's Chronicle. */
+function legacyInitiallyOpenChannels(): Set<string> {
+  const ids = new Set<string>();
+  for (const name of monitoredChannels.keys()) ids.add(`zulip:${name}`);
+  for (const state of monitoredDiscordChannels.values()) {
+    ids.add(`discord:${state.guildId}:${state.channelId}`);
+  }
+  for (const id of monitoredSlackChannels.keys()) ids.add(`slack:${id}`);
+  for (const name of (process.env.ZULIP_SUBSCRIBE ?? '').split(',').map((v) => v.trim()).filter(Boolean)) {
+    ids.add(`zulip:${name}`);
+  }
+  return ids;
+}
+
+function clearMigratedLifecycleState(registeredIds: ReadonlySet<string>): void {
+  for (const name of monitoredChannels.keys()) {
+    if (registeredIds.has(`zulip:${name}`)) monitoredChannels.delete(name);
+  }
+  for (const [id, state] of monitoredDiscordChannels) {
+    if (registeredIds.has(`discord:${state.guildId}:${id}`)) monitoredDiscordChannels.delete(id);
+  }
+  for (const id of monitoredSlackChannels.keys()) {
+    if (registeredIds.has(`slack:${id}`)) monitoredSlackChannels.delete(id);
+  }
+  saveState();
+}
+
 async function initializeZulipClient(): Promise<void> {
   const config: any = {
     realm: process.env.ZULIP_REALM || "",
@@ -240,26 +285,26 @@ async function initializeZulipClient(): Promise<void> {
     console.error("Failed to fetch bot profile for self-filter:", err);
   }
 
-  // Auto-subscribe to streams named in ZULIP_SUBSCRIBE (comma-separated).
-  // Needed because Zulip's event queue only delivers message events for streams
-  // the bot is subscribed to, even with all_public_streams: true on the queue.
-  if (process.env.ZULIP_SUBSCRIBE) {
-    const streams = process.env.ZULIP_SUBSCRIBE.split(",").map(s => s.trim()).filter(Boolean);
-    if (streams.length > 0) {
-      try {
-        const result = await zulipClient.users.me.subscriptions.add({
-          subscriptions: streams.map(name => ({ name })),
-        });
-        const subscribed = result?.subscribed ?? {};
-        const already = result?.already_subscribed ?? {};
-        console.error(`Zulip MCP auto-subscribed: new=${JSON.stringify(subscribed)} already=${JSON.stringify(already)}`);
-      } catch (err) {
-        console.error(`Zulip MCP auto-subscribe failed for [${streams.join(", ")}]:`, err);
-      }
-    }
-  }
-
+  // Plain-MCP bootstrap for explicit Zulip membership (especially private
+  // channels). In MCPL mode channel_open owns this operation; public-channel
+  // events remain observable through all_public_streams even when closed.
   console.error(`Zulip MCP initialized with session: ${sessionId}`);
+}
+
+async function subscribeConfiguredZulipStreams(): Promise<void> {
+  if (!zulipClient || !process.env.ZULIP_SUBSCRIBE) return;
+  const streams = process.env.ZULIP_SUBSCRIBE.split(',').map((s) => s.trim()).filter(Boolean);
+  if (streams.length === 0) return;
+  try {
+    const result = await zulipClient.users.me.subscriptions.add({
+      subscriptions: streams.map((name) => ({ name })),
+    });
+    const subscribed = result?.subscribed ?? {};
+    const already = result?.already_subscribed ?? {};
+    console.error(`Zulip MCP auto-subscribed: new=${JSON.stringify(subscribed)} already=${JSON.stringify(already)}`);
+  } catch (err) {
+    console.error(`Zulip MCP auto-subscribe failed for [${streams.join(', ')}]:`, err);
+  }
 }
 
 async function initializeSlackClient(): Promise<void> {
@@ -520,7 +565,7 @@ function getTools(): Tool[] {
   {
     name: "listen",
     description:
-      "Subscribe the bot to one or more Zulip streams. Required before the bot can receive real-time message events from a stream — event queues with all_public_streams only deliver events for streams the bot is subscribed to. Subscription persists server-side across session restarts.",
+      "Subscribe the bot to one or more Zulip streams. Required for private-stream access; public streams are observable through the all_public_streams event queue. Subscription persists server-side across session restarts.",
     inputSchema: {
       type: "object",
       properties: {
@@ -1200,11 +1245,19 @@ function getTools(): Tool[] {
     });
   }
 
-  return tools;
+  if (!hostOwnsChannelLifecycle()) return tools;
+
+  // In MCPL mode the generic host owns channel lifecycle in Chronicle. Keep
+  // these tools for standalone MCP users, but avoid presenting two competing
+  // subscription/monitoring systems to an agent hosted by Connectome.
+  return tools.filter((tool) => !LEGACY_LIFECYCLE_TOOLS.has(tool.name));
 }
 
 // Handle tool execution
 async function handleToolCall(name: string, args: any): Promise<any> {
+  if (hostOwnsChannelLifecycle() && LEGACY_LIFECYCLE_TOOLS.has(name)) {
+    throw new Error(`${name} is retired in MCPL mode; use channel_open/channel_close/channel_list`);
+  }
   // Check if the required client is initialized
   const isDiscordTool = name.startsWith("discord_");
   const isSlackTool = name.startsWith("slack_");
@@ -1389,8 +1442,8 @@ async function handleToolCall(name: string, args: any): Promise<any> {
       });
       
       // Auto-monitor: Start monitoring this channel if requested (default: true)
-      const autoMonitor = args.auto_monitor !== false;
-      let monitoringStatus = "not_monitored";
+      const autoMonitor = !hostOwnsChannelLifecycle() && args.auto_monitor !== false;
+      let monitoringStatus = hostOwnsChannelLifecycle() ? "host_managed" : "not_monitored";
       
       if (autoMonitor && result.messages.length > 0) {
         const latestMessageId = Math.max(...result.messages.map((m: any) => m.id));
@@ -1825,8 +1878,8 @@ async function handleToolCall(name: string, args: any): Promise<any> {
         .reverse(); // Oldest first
       
       // Auto-monitor
-      const autoMonitor = args.auto_monitor !== false;
-      let monitoringStatus = "not_monitored";
+      const autoMonitor = !hostOwnsChannelLifecycle() && args.auto_monitor !== false;
+      let monitoringStatus = hostOwnsChannelLifecycle() ? "host_managed" : "not_monitored";
       
       if (autoMonitor && filteredMessages.length > 0) {
         const latestMessageId = filteredMessages[filteredMessages.length - 1].id;
@@ -2222,8 +2275,8 @@ async function handleToolCall(name: string, args: any): Promise<any> {
       });
 
       // Auto-monitor
-      const autoMonitor = args.auto_monitor !== false;
-      let monitoringStatus = "not_monitored";
+      const autoMonitor = !hostOwnsChannelLifecycle() && args.auto_monitor !== false;
+      let monitoringStatus = hostOwnsChannelLifecycle() ? "host_managed" : "not_monitored";
 
       if (autoMonitor && rawMessages.length > 0) {
         const latestTs = String(rawMessages[rawMessages.length - 1].ts);
@@ -2506,7 +2559,7 @@ const mcplServerCaps = MCPL_ENABLED ? buildServerCapabilities(ENABLED_PLATFORMS)
 const server = new Server(
   {
     name: "zulip-mcp-server",
-    version: "2.2.0",
+    version: "2.2.1",
   },
   {
     capabilities: {
@@ -2556,7 +2609,7 @@ server.setRequestHandler(ListResourcesRequestSchema, async () => {
   const resources: any[] = [];
   
   // Zulip resources
-  if (ENABLE_ZULIP && zulipClient) {
+  if (!hostOwnsChannelLifecycle() && ENABLE_ZULIP && zulipClient) {
     resources.push(
       {
         uri: "zulip://unread/summary",
@@ -2584,7 +2637,7 @@ server.setRequestHandler(ListResourcesRequestSchema, async () => {
   }
   
   // Discord resources
-  if (ENABLE_DISCORD && discordClient) {
+  if (!hostOwnsChannelLifecycle() && ENABLE_DISCORD && discordClient) {
     resources.push(
       {
         uri: "discord://unread/summary",
@@ -2612,7 +2665,7 @@ server.setRequestHandler(ListResourcesRequestSchema, async () => {
   }
 
   // Slack resources
-  if (ENABLE_SLACK && slackWebClient) {
+  if (!hostOwnsChannelLifecycle() && ENABLE_SLACK && slackWebClient) {
     resources.push(
       {
         uri: "slack://unread/summary",
@@ -3012,6 +3065,7 @@ async function main() {
     if (ENABLE_ZULIP) {
       try {
         await initializeZulipClient();
+        if (!MCPL_ENABLED) await subscribeConfiguredZulipStreams();
         enabledServices.push("Zulip");
       } catch (error) {
         console.error("Failed to initialize Zulip:", error);
@@ -3064,7 +3118,10 @@ async function main() {
         adapters.set('slack', new SlackAdapter(slackWebClient, slackSocketClient, slackSelfUserId, slackTeamName));
       }
 
-      const channelManager = new ChannelManager(client, adapters, MCPL_BATCH_WINDOW_MS);
+      const channelManager = new ChannelManager(client, adapters, MCPL_BATCH_WINDOW_MS, {
+        initiallyOpen: legacyInitiallyOpenChannels(),
+        onInitialRegistrationAcknowledged: clearMigratedLifecycleState,
+      });
       const contextProvider = new ContextProvider(channelManager, MCPL_CONTEXT_HISTORY_SIZE);
 
       // Register dispatcher handlers
@@ -3081,6 +3138,9 @@ async function main() {
       );
       dispatcher.register(McplMethod.ChannelsClose, (params) =>
         channelManager.closeChannel(params as unknown as ChannelsCloseParams),
+      );
+      dispatcher.register(McplMethod.ChannelsAcknowledge, (params) =>
+        channelManager.acknowledge(params as unknown as ChannelsAcknowledgeParams),
       );
       dispatcher.register(McplMethod.ChannelsList, () =>
         channelManager.listChannels(),
@@ -3100,31 +3160,37 @@ async function main() {
 
       // Create MCPL transport and connect
       const transport = new McplTransport(dispatcher, client);
+      activeMcplTransport = transport;
       await server.connect(transport);
 
       // After handshake completes, register channels and start event loops
       // Use a small delay to ensure the initialize handshake is complete
       setTimeout(async () => {
+        if (!transport.getHostCapabilities()) {
+          await subscribeConfiguredZulipStreams();
+          console.error('Host did not negotiate MCPL; retaining standalone MCP monitoring state');
+          return;
+        }
         try {
           await channelManager.registerChannels();
         } catch (error) {
           console.error('Failed to register channels after connect:', error);
+          return;
+        }
+
+        // Real-time event delivery is an MCPL feature. Plain MCP clients use
+        // the pull tools/resources and must not receive unsolicited requests.
+        for (const adapter of adapters.values()) {
+          adapter.startEvents(
+            (message) => {
+              channelManager.onIncomingMessage(message.channelId, message);
+            },
+            (event) => {
+              channelManager.broadcastSystemEvent(adapter.type, event);
+            },
+          );
         }
       }, 1000);
-
-      // Start real-time event delivery for every adapter
-      for (const adapter of adapters.values()) {
-        adapter.startEvents(
-          (message) => {
-            channelManager.onIncomingMessage(message.channelId, message);
-          },
-          (event) => {
-            // Delivery gaps / degraded polling: surface to the agent as a
-            // synthetic system message on the platform's open channels.
-            channelManager.broadcastSystemEvent(adapter.type, event);
-          },
-        );
-      }
 
       console.error(`MCPL server running with: ${enabledServices.join(", ")}`);
     } else {

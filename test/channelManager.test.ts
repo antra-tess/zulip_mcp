@@ -63,7 +63,7 @@ test('publish throws for unknown channel prefix', async () => {
 test('publish forwards last-incoming thread hints to the adapter', async () => {
   const { manager, calls } = makeManager();
   await manager.registerChannels();
-  manager.openChannel({ type: 'slack' });
+  await manager.openChannel({ type: 'slack' });
 
   manager.onIncomingMessage('slack:C1', {
     channelId: 'slack:C1',
@@ -119,7 +119,7 @@ test('broadcastSystemEvent reaches open channels of the platform without clobber
   const { adapter, calls } = fakeAdapter('zulip', [desc]);
   const manager = new ChannelManager(client, new Map([['zulip', adapter]]), 10);
   await manager.registerChannels();
-  manager.openChannel({ type: 'zulip' });
+  await manager.openChannel({ type: 'zulip' });
 
   // Real conversation establishes thread routing.
   manager.onIncomingMessage('zulip:general', {
@@ -181,4 +181,152 @@ test('incoming messages on unopened channels are ignored', () => {
   // No assertion target beyond "doesn't throw" — hint state is private;
   // covered indirectly by the publish-hints test requiring openChannel.
   assert.ok(true);
+});
+
+test('registration advertises legacy initial state and lifecycle capabilities, then clears migration state', async () => {
+  const registered: ChannelDescriptor[][] = [];
+  const migrated: string[][] = [];
+  const client = {
+    registerChannels: async (channels: ChannelDescriptor[]) => {
+      registered.push(channels);
+      return { registered: channels.map((channel) => channel.id) };
+    },
+    sendIncoming: async () => {},
+    sendPushEvent: async () => {},
+  } as any;
+  const desc: ChannelDescriptor = {
+    id: 'slack:C1',
+    type: 'slack',
+    label: '#general',
+    direction: 'bidirectional',
+    address: { channel_id: 'C1' },
+  };
+  const { adapter } = fakeAdapter('slack', [desc]);
+  adapter.fetchHistory = async () => [];
+  adapter.acknowledge = async () => ({ acknowledged: true, representation: 'eyes' });
+  const manager = new ChannelManager(client, new Map([['slack', adapter]]), 10, {
+    initiallyOpen: new Set(['slack:C1']),
+    onInitialRegistrationAcknowledged: (ids) => migrated.push([...ids]),
+  });
+
+  await manager.registerChannels();
+
+  assert.equal(registered[0][0].initiallyOpen, true);
+  assert.deepEqual(registered[0][0].capabilities?.history, {
+    maxMessages: 200,
+    supportsBeforeMessage: true,
+  });
+  assert.deepEqual(registered[0][0].capabilities?.acknowledgment, {
+    kind: 'reaction',
+    supportsValue: true,
+  });
+  assert.deepEqual(migrated, [['slack:C1']]);
+  manager.destroy();
+});
+
+test('exact open returns backscroll before committing platform subscription; close reverses it', async () => {
+  const order: string[] = [];
+  const desc: ChannelDescriptor = {
+    id: 'zulip:general',
+    type: 'zulip',
+    label: '#general',
+    direction: 'bidirectional',
+  };
+  const { adapter } = fakeAdapter('zulip', [desc]);
+  adapter.fetchHistory = async (_id, _descriptor, limit, before) => {
+    order.push(`history:${limit}:${before}`);
+    return [{
+      channelId: desc.id,
+      messageId: '1',
+      author: { id: 'u1', name: 'Alice' },
+      timestamp: new Date(0).toISOString(),
+      content: [{ type: 'text', text: 'hello' }],
+    }];
+  };
+  adapter.openChannel = async () => { order.push('open'); };
+  adapter.closeChannel = async () => { order.push('close'); };
+  const manager = new ChannelManager(fakeMcplClient, new Map([['zulip', adapter]]), 10);
+  await manager.registerChannels();
+
+  const result = await manager.openChannel({
+    channelId: desc.id,
+    type: 'zulip',
+    history: { limit: 20, beforeMessageId: '99' },
+  });
+  assert.equal(result.channel.id, desc.id);
+  assert.deepEqual(result.history?.map((message) => message.messageId), ['1']);
+  assert.deepEqual(order, ['history:20:99', 'open']);
+  assert.equal(manager.getOpenChannels().has(desc.id), true);
+
+  assert.deepEqual(await manager.closeChannel({ channelId: desc.id }), { closed: true });
+  assert.deepEqual(order, ['history:20:99', 'open', 'close']);
+  assert.equal(manager.getOpenChannels().has(desc.id), false);
+  manager.destroy();
+});
+
+test('closed addressed messages become gated push events with the exact channel id', async () => {
+  const pushed: any[] = [];
+  const client = {
+    registerChannels: async () => ({ registered: ['slack:C1'] }),
+    sendIncoming: async () => {},
+    sendPushEvent: async (event: unknown) => { pushed.push(event); },
+  } as any;
+  const desc: ChannelDescriptor = {
+    id: 'slack:C1',
+    type: 'slack',
+    label: '#general',
+    direction: 'bidirectional',
+  };
+  const { adapter } = fakeAdapter('slack', [desc]);
+  const manager = new ChannelManager(client, new Map([['slack', adapter]]), 10);
+  await manager.registerChannels();
+
+  manager.onIncomingMessage(desc.id, {
+    channelId: desc.id,
+    messageId: '1718.1',
+    author: { id: 'U1', name: 'Alice' },
+    timestamp: new Date(0).toISOString(),
+    content: [{ type: 'text', text: '<@bot> hello' }],
+    metadata: { mentioned: true },
+  });
+  manager.onIncomingMessage(desc.id, {
+    channelId: desc.id,
+    messageId: '1718.2',
+    author: { id: 'U1', name: 'Alice' },
+    timestamp: new Date(0).toISOString(),
+    content: [{ type: 'text', text: 'ambient' }],
+    metadata: { mentioned: false },
+  });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+
+  assert.equal(pushed.length, 1);
+  assert.equal(pushed[0].origin.mcplChannelId, desc.id);
+  assert.equal(pushed[0].origin.isExplicitMention, true);
+  assert.deepEqual(pushed[0].tags.slice(0, 2), ['chat:addressed', 'chat:mention']);
+  manager.destroy();
+});
+
+test('acknowledgment routes to the owning platform adapter', async () => {
+  const desc: ChannelDescriptor = {
+    id: 'slack:C1', type: 'slack', label: '#general', direction: 'bidirectional',
+  };
+  const { adapter } = fakeAdapter('slack', [desc]);
+  const calls: unknown[][] = [];
+  adapter.acknowledge = async (...args) => {
+    calls.push(args);
+    return { acknowledged: true, representation: '✅' };
+  };
+  const manager = new ChannelManager(fakeMcplClient, new Map([['slack', adapter]]), 10);
+  await manager.registerChannels();
+
+  assert.deepEqual(await manager.acknowledge({
+    channelId: desc.id,
+    messageId: '1718.1',
+    intent: 'seen-not-opening',
+    value: '✅',
+  }), { acknowledged: true, representation: '✅' });
+  assert.equal(calls[0][0], desc.id);
+  assert.equal(calls[0][2], '1718.1');
+  assert.equal(calls[0][3], '✅');
+  manager.destroy();
 });

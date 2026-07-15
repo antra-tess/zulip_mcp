@@ -7,7 +7,7 @@
  */
 
 import { realpathSync } from "node:fs";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath } from "node:url";
 
 /**
  * Run-as-main detection that survives npm bin symlinks. Node resolves the
@@ -18,7 +18,7 @@ import { pathToFileURL } from "node:url";
 export function isMainModule(importMetaUrl: string, argv1: string | undefined): boolean {
   if (!argv1) return false;
   try {
-    return importMetaUrl === pathToFileURL(realpathSync(argv1)).href;
+    return realpathSync(fileURLToPath(importMetaUrl)) === realpathSync(argv1);
   } catch {
     return false;
   }

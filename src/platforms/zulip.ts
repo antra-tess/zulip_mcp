@@ -13,6 +13,7 @@ import type {
   McplContentBlock,
   McplContextInjection,
   McplTextContent,
+  ChannelsAcknowledgeResult,
 } from '../mcpl/types.js';
 import type { PlatformAdapter, PublishResult, RoutingHints, OnIncomingMessage, OnSystemEvent } from './adapter.js';
 import { ZulipEventLoop } from './zulip-events.js';
@@ -54,6 +55,70 @@ export class ZulipAdapter implements PlatformAdapter {
       console.error('Failed to discover Zulip streams:', error);
     }
     return channels;
+  }
+
+  async openChannel(channelId: string): Promise<void> {
+    const name = channelId.slice('zulip:'.length);
+    await this.zulipClient.users.me.subscriptions.add({
+      subscriptions: [{ name }],
+    });
+  }
+
+  async closeChannel(channelId: string, descriptor: ChannelDescriptor): Promise<void> {
+    // all_public_streams keeps public-channel events flowing even after the bot
+    // leaves, which lets a closed @mention reach the host's wake gate. Private
+    // channels have no equivalent: retain membership but close the local MCPL
+    // delivery gate so the agent remains addressable there.
+    if (descriptor.metadata?.is_public !== true) return;
+    const name = channelId.slice('zulip:'.length);
+    await this.zulipClient.users.me.subscriptions.remove({
+      subscriptions: JSON.stringify([name]),
+    });
+  }
+
+  async fetchHistory(
+    channelId: string,
+    _descriptor: ChannelDescriptor,
+    limit: number,
+    beforeMessageId?: string,
+  ): Promise<ChannelIncomingMessage[]> {
+    const streamName = channelId.slice('zulip:'.length);
+    const anchor = beforeMessageId && /^\d+$/.test(beforeMessageId)
+      ? Number(beforeMessageId)
+      : 'newest';
+    const result = await this.zulipClient.messages.retrieve({
+      anchor,
+      num_before: limit,
+      num_after: 0,
+      narrow: [['stream', streamName]],
+    });
+    return (result.messages ?? [])
+      .filter((message: any) => String(message.id) !== beforeMessageId)
+      .slice(-limit)
+      .sort((a: any, b: any) => a.timestamp - b.timestamp)
+      .map((message: any) => this.toIncoming(streamName, message, [], true));
+  }
+
+  async acknowledge(
+    _channelId: string,
+    _descriptor: ChannelDescriptor,
+    messageId: string,
+    value?: string,
+  ): Promise<ChannelsAcknowledgeResult> {
+    const representation = value?.trim() || '👀';
+    const emojiName = representation === '👀'
+      ? 'eyes'
+      : representation.replace(/^:|:$/g, '');
+    try {
+      await this.zulipClient.reactions.add({
+        message_id: Number(messageId),
+        emoji_name: emojiName,
+        reaction_type: 'unicode_emoji',
+      });
+      return { acknowledged: true, representation };
+    } catch (error) {
+      return { acknowledged: false, reason: (error as Error).message };
+    }
   }
 
   async publish(
@@ -172,39 +237,7 @@ export class ZulipAdapter implements PlatformAdapter {
     this.eventLoop = new ZulipEventLoop();
     this.eventLoop.start(this.zulipClient, (streamName, msg, flags) => {
       if (this.selfUserId !== null && msg.sender_id === this.selfUserId) return;
-      const channelId = `zulip:${streamName}`;
-      const cleaned = cleanContent(msg.content);
-      const attachments = extractZulipAttachments(msg.content);
-      const content: McplTextContent[] = [{ type: 'text', text: cleaned }];
-      if (attachments.length > 0) {
-        // Reference-only by default: agent reads the note, then decides
-        // whether to call fetch_attachment to pull bytes into context.
-        const lines = attachments.map(a =>
-          `- ${a.name} (${a.mimeType})${a.isImage ? ' — image, fetchable via fetch_attachment' : ''}: ${a.path}`,
-        );
-        content.push({
-          type: 'text',
-          text: `[attachments: ${attachments.length}]\n${lines.join('\n')}`,
-        });
-      }
-      const incoming: ChannelIncomingMessage = {
-        channelId,
-        messageId: String(msg.id),
-        threadId: msg.subject || undefined,
-        author: { id: String(msg.sender_id), name: msg.sender_full_name },
-        timestamp: new Date(msg.timestamp * 1000).toISOString(),
-        content,
-        metadata: {
-          senderEmail: msg.sender_email,
-          topic: msg.subject,
-          // Zulip's server-computed flag: personal or user-group mention of
-          // the bot. Wildcards (@all/@everyone) deliberately don't count.
-          mentioned: flags.includes('mentioned'),
-          botUserId: this.selfUserId !== null ? String(this.selfUserId) : this.sessionId,
-          ...(attachments.length > 0 ? { attachments } : {}),
-        },
-      };
-      onMessage(incoming);
+      onMessage(this.toIncoming(streamName, msg, flags, false));
     }, onSystemEvent).catch(error => {
       console.error('Zulip event loop failed:', error);
     });
@@ -213,5 +246,41 @@ export class ZulipAdapter implements PlatformAdapter {
   stopEvents(): void {
     this.eventLoop?.stop();
     this.eventLoop = null;
+  }
+
+  private toIncoming(
+    streamName: string,
+    msg: any,
+    flags: string[],
+    backscroll: boolean,
+  ): ChannelIncomingMessage {
+    const cleaned = cleanContent(msg.content);
+    const attachments = extractZulipAttachments(msg.content);
+    const content: McplTextContent[] = [{ type: 'text', text: cleaned }];
+    if (attachments.length > 0) {
+      const lines = attachments.map(a =>
+        `- ${a.name} (${a.mimeType})${a.isImage ? ' — image, fetchable via fetch_attachment' : ''}: ${a.path}`,
+      );
+      content.push({
+        type: 'text',
+        text: `[attachments: ${attachments.length}]\n${lines.join('\n')}`,
+      });
+    }
+    return {
+      channelId: `zulip:${streamName}`,
+      messageId: String(msg.id),
+      threadId: msg.subject || undefined,
+      author: { id: String(msg.sender_id), name: msg.sender_full_name },
+      timestamp: new Date(msg.timestamp * 1000).toISOString(),
+      content,
+      metadata: {
+        senderEmail: msg.sender_email,
+        topic: msg.subject,
+        mentioned: flags.includes('mentioned'),
+        botUserId: this.selfUserId !== null ? String(this.selfUserId) : this.sessionId,
+        ...(backscroll ? { backscroll: true } : {}),
+        ...(attachments.length > 0 ? { attachments } : {}),
+      },
+    };
   }
 }
