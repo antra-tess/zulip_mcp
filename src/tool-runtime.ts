@@ -223,6 +223,11 @@ export class ZulipToolRuntime {
    *  so a rollback checkpoint can undo it. */
   onSent: ((sent: SentRecord) => void) | null = null;
 
+  /** Set by the MCPL server: streams `listen` just subscribed the bot to, so
+   *  they can be registered without waiting for a refresh or an event (#20).
+   *  Awaited, so `listen` answers only once the channel is registered. */
+  onSubscribed: ((streams: string[]) => void | Promise<void>) | null = null;
+
   private readonly uploader: Uploader | null;
   private readonly uploadPolicy: UploadPolicy;
   /** Line time for fetch_history / fetch_around, shared with live delivery. */
@@ -399,6 +404,12 @@ export class ZulipToolRuntime {
           const result = await zulipClient.users.me.subscriptions.add({
             subscriptions: channels.map(name => ({ name })),
           });
+          // A stream the bot just joined is not in the host's channel list
+          // yet; registering it here is what makes it openable without a
+          // refresh or a restart (#20).
+          const unauthorized: string[] = Array.isArray(result?.unauthorized) ? result.unauthorized : [];
+          const joined = channels.filter((name) => !unauthorized.includes(name));
+          if (result?.result === "success" && joined.length > 0) await this.onSubscribed?.(joined);
           return {
             result: result?.result,
             subscribed: result?.subscribed ?? {},

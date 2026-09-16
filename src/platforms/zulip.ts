@@ -52,7 +52,9 @@ import {
 /** The address every stream descriptor carries. */
 export interface ZulipChannelAddress {
   stream_name: string;
-  stream_id: number;
+  /** Absent only when a stream was described from an event that carried no
+   *  id; the name addresses every send, and typing degrades to a no-op. */
+  stream_id?: number;
 }
 
 export function zulipChannelId(streamName: string): string {
@@ -169,31 +171,41 @@ export class ZulipAdapter implements PlatformAdapter {
       const streams = result.streams || [];
       for (const stream of streams) {
         if (!this.filters.streamAllowed(stream.name)) continue;
-        const address: ZulipChannelAddress = { stream_name: stream.name, stream_id: stream.stream_id };
-        channels.push({
-          id: zulipChannelId(stream.name),
-          type: 'zulip',
-          label: `#${stream.name}`,
-          direction: 'bidirectional',
-          address,
-          metadata: {
-            subscriber_count: stream.subscriber_count,
-            is_public: !stream.invite_only,
-          },
-          capabilities: {
-            history: {
-              maxMessages: this.backscrollLimitFor(stream.name),
-              supportsBeforeMessage: true,
-              supportsSinceLastSeen: true,
-            },
-          },
-        });
+        channels.push(this.streamDescriptor(stream.name, stream.stream_id, {
+          subscriber_count: stream.subscriber_count,
+          is_public: !stream.invite_only,
+        }));
       }
     } catch (error) {
       console.error('Failed to discover Zulip streams:', error);
     }
     channels.push(...(await this.discoverDmChannels()));
     return channels;
+  }
+
+  /**
+   * The descriptor for a stream. Built from discovery and, for a stream the
+   * bot joined after startup, from the first message that arrives on it —
+   * both must describe the same channel, so they share this (#20).
+   */
+  private streamDescriptor(name: string, streamId: number | undefined, metadata: Record<string, unknown> = {}): ChannelDescriptor {
+    const address: ZulipChannelAddress = { stream_name: name, stream_id: streamId };
+    const descriptor: ChannelDescriptor = {
+      id: zulipChannelId(name),
+      type: 'zulip',
+      label: `#${name}`,
+      direction: 'bidirectional',
+      address,
+      metadata,
+      capabilities: {
+        history: {
+          maxMessages: this.backscrollLimitFor(name),
+          supportsBeforeMessage: true,
+          supportsSinceLastSeen: true,
+        },
+      },
+    };
+    return descriptor;
   }
 
   /**
@@ -518,7 +530,18 @@ export class ZulipAdapter implements PlatformAdapter {
         return;
       }
       if (m.streamName !== null && !this.filters.streamAllowed(m.streamName)) return;
-      onMessage(toIncoming(channelIdOf(m, this.identity.selfUserId), m, this.identity));
+      // A stream the bot joined after startup is unknown to the host; the
+      // message proves it is reachable, so it travels with its descriptor
+      // (#20). Sent with EVERY message, never suppressed as "already
+      // described": the registry that decides what is new is the server's,
+      // it is cleared on reconnect, and a descriptor the host refused or
+      // never confirmed must be offered again rather than held back by
+      // adapter-side memory.
+      const channelId = channelIdOf(m, this.identity.selfUserId);
+      const descriptor = m.streamName !== null
+        ? this.streamDescriptor(m.streamName, typeof msg.stream_id === 'number' ? msg.stream_id : undefined)
+        : undefined;
+      onMessage(toIncoming(channelId, m, this.identity), descriptor);
     }, onSystemEvent, reactionHandler).catch(error => {
       console.error('Zulip event loop failed:', error);
     });

@@ -151,12 +151,47 @@ them too; add `"tagsNone": ["chat:reaction", "chat:reaction-remove"]` to it.
 
 | Channel id | What it is |
 |---|---|
-| `zulip:<stream>` | A stream. Topics are threads: incoming messages carry the topic as `threadId`; publishes go to the topic of the most recent incoming message, else `mcpl`. |
+| `zulip:<stream>` | A stream. Topics are threads: incoming messages carry the topic as `threadId`; publishes go to the topic of the most recent incoming message, else `mcpl`. Streams visible at startup are registered then; one the bot joins later announces itself (see below). |
 | `zulip:dm:<ids>` | A DM conversation, keyed by the other parties' sorted user ids (`zulip:dm:42`, `zulip:dm:7+42`). Discovered from recent DM history and announced on the fly (`channels/changed`) when someone new writes. |
 
 Descriptors carry `capabilities.history` (`maxMessages`, `supportsBeforeMessage`,
 `supportsSinceLastSeen`); `channels/open` may ask for history and gets it
 before the lifecycle commits.
+
+**Channels that appear after startup.** The bot does not have to be
+restarted to use a stream it was added to later. Three things register one,
+whichever happens first: the `listen` tool registers what it subscribes the
+bot to; the first message from the stream carries its descriptor, the way a
+DM from a new conversation does, so the mention that wakes the agent also
+makes the channel openable; and `refresh_channels` re-enumerates everything
+visible. Until one of them happens, `channels/open` answers
+`-32023 Unknown channel`.
+
+A `channels/changed` announcement the host never confirms is not a refusal:
+the channel stays usable here and is re-announced on the next explicit
+registration (`refresh_channels`, `listen`, a widened allowlist — never the
+message path, where an announcement sits in front of a delivery).
+`refresh_channels` reports it under `pendingAnnouncement`. The retry set is
+capped at 100 channels; past that the oldest stops being retried and stays
+usable. One consequence worth knowing: `channels/list` can name a channel
+the host never confirmed.
+
+Silence is not refusal either. A host that itemizes only the descriptors it
+changed leaves the rest unstated, and they are treated as pending, not
+refused. An itemized `accepted: false` IS the host's answer: the channel is
+unregistered and closed, it is not announced again, and `refresh_channels`
+lists it under `refused`. Asking again is an agent decision — an explicit
+`refresh_channels` retries refused channels.
+
+An announcement waits 5 seconds, not the protocol default of 30. This
+server answers one request at a time, and agent-framework's
+`channels/changed` handler reconciles (a blocking `channels/open` per
+descriptor) *before* it answers, while its `channels/register` handler
+answers first. So an announcement made inside a tool call cannot be
+answered until that call returns. Timing out quickly keeps the channel
+usable, lets the host's own `channels/open` be served, and leaves the
+re-announcement to the next refresh; descriptors are recorded before the
+announcement goes out so that open succeeds when it lands.
 
 ## Filters plane
 
