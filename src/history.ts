@@ -93,6 +93,7 @@ export interface ZulipMessage {
   timestamp: Date;
   /** Raw markdown (history is fetched with apply_markdown=false). */
   rawContent: string;
+  /** Raw markdown with line endings normalised and trimmed; not HTML-stripped (#24). */
   cleanContent: string;
   mentioned: boolean;
   wildcardMentioned: boolean;

@@ -377,6 +377,7 @@ test('reaction events are forwarded to the reaction handler and never to onMessa
     reactions.push({ op: ev.op, emoji_name: ev.emoji_name, message_id: ev.message_id, name: ev.user?.full_name });
   });
   assert.deepEqual(registered[0].event_types, ['message', 'reaction'], 'the queue asks for reactions');
+  assert.equal(registered[0].apply_markdown, 'false', 'the queue asks for raw markdown; cleanMarkdown depends on it (#24)');
   assert.deepEqual(messages, []);
   assert.deepEqual(reactions, [
     { op: 'add', emoji_name: 'thumbs_up', message_id: 77, name: 'Ann' },
