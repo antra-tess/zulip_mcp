@@ -50,7 +50,7 @@ import {
   type StateRollbackResult,
   type TextContent,
 } from '@animalabs/mcpl-core';
-import { ChannelManager, type HostClient } from './channels.js';
+import { ChannelManager, type HostClient, type RegisterAdditionalResult } from './channels.js';
 import { ContextProvider } from './context.js';
 import { DeliveryState, attributeMessage, renderMissedBlock, selectMissed, viewOf, DEFAULT_MISSED_BLOCK_MAX_CHARS } from './delivery.js';
 import { McplRpcError, capabilityDenied } from './errors.js';
@@ -223,16 +223,9 @@ export class ZulipMcplServer {
     this.tools.onSent = (sent) => this.stateTracker.recordSent(sent.messageId, sent.channelId, sent.content);
     // A stream `listen` just subscribed the bot to is registered at once, so
     // the host can open it without waiting for a message or a refresh (#20).
-    // Awaited by the tool, and coalesced: five `listen` calls in a row must
-    // not fan out into five realm enumerations (each carries a DM history
-    // fetch), nor race each other into announcing the same channel twice.
-    this.tools.onSubscribed = async (streams) => {
-      try {
-        await this.refreshChannelsCoalesced();
-      } catch (error) {
-        console.error(`[zulip-mcp] registering ${streams.join(', ')} after listen failed:`, error);
-      }
-    };
+    // Only those streams: a realm enumeration here would cost a full stream
+    // list plus a DM-history fetch to announce what the caller already named.
+    this.tools.onSubscribed = (streams) => this.registerSubscribed(streams);
   }
 
   /** True when the connected peer negotiated MCPL. */
@@ -656,6 +649,9 @@ export class ZulipMcplServer {
   private async handleChannelOpen(params: ChannelsOpenParams): Promise<ChannelsOpenResult> {
     if (!this.grant.has('channels.lifecycle')) throw capabilityDenied('channels.lifecycle');
     const descriptor = this.channelManager.findChannel(params);
+    // Opening a channel is proof the host knows it — the only proof available
+    // when the answer to its announcement cannot reach us (#20 review).
+    this.channelManager.confirmAnnounced(descriptor.id);
     const result: ChannelsOpenResult = { channel: descriptor };
 
     // Zulip only delivers stream events to subscribers; an open channel the
@@ -714,6 +710,9 @@ export class ZulipMcplServer {
   }
 
   private handleChannelClose(params: ChannelsCloseParams): { closed: boolean } {
+    // As with open: the host named a channel, so it has it. agent-framework
+    // reconciles a channel it does not want with `channels/close`.
+    this.channelManager.confirmAnnounced(params.channelId);
     const result = this.channelManager.closeChannel(params);
     this.delivery.markClosed(params.channelId);
     this.delivery.save();
@@ -1355,16 +1354,26 @@ export class ZulipMcplServer {
     return { visible: descriptors.length, added: result.announced, local: result.local, refused: result.refused, reason: result.reason };
   }
 
-  /** One re-enumeration at a time; concurrent callers await the one in flight. */
-  private refreshInFlight: Promise<unknown> | null = null;
-
-  private refreshChannelsCoalesced(): Promise<unknown> {
-    if (!this.refreshInFlight) {
-      this.refreshInFlight = this.applyFilterChange().finally(() => {
-        this.refreshInFlight = null;
-      });
+  /**
+   * Register the streams `listen` just subscribed the bot to, and say how it
+   * went so the tool can report it rather than hiding it in stderr.
+   */
+  private async registerSubscribed(streams: string[]): Promise<RegisterAdditionalResult> {
+    const empty: RegisterAdditionalResult = { announced: [], local: [], refused: [] };
+    if (!this.conn || !this.mcplActive) {
+      return { ...empty, reason: 'not connected to an MCPL host; channels are registered in MCPL mode only' };
     }
-    return this.refreshInFlight;
+    if (!this.adapter.describeChannels) return empty;
+    try {
+      const descriptors = await this.adapter.describeChannels(streams.map((name) => `zulip:${name}`));
+      const allowed = descriptors.filter((d) => this.isAllowed(d.id));
+      if (allowed.length === 0) return empty;
+      return await this.channelManager.registerAdditional(allowed, { retryBacklog: true });
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      console.error(`[zulip-mcp] registering ${streams.join(', ')} after listen failed:`, error);
+      return { ...empty, reason };
+    }
   }
 
   private requireFilters(): FiltersPlane {

@@ -171,10 +171,18 @@ A `channels/changed` announcement the host never confirms is not a refusal:
 the channel stays usable here and is re-announced on the next explicit
 registration (`refresh_channels`, `listen`, a widened allowlist — never the
 message path, where an announcement sits in front of a delivery).
-`refresh_channels` reports it under `pendingAnnouncement`. The retry set is
-capped at 100 channels; past that the oldest stops being retried and stays
-usable. One consequence worth knowing: `channels/list` can name a channel
-the host never confirmed.
+`refresh_channels` reports it under `pendingAnnouncement`, and `listen`
+under `registration`. The retry set is capped at 100 channels; past that the
+oldest stops being retried and stays usable. One consequence worth knowing:
+`channels/list` can name a channel the host never confirmed.
+
+A host that opens or closes a channel has confirmed it, whatever became of
+the announcement, and it leaves the retry set at that point. Against
+agent-framework that is the only confirmation available for an announcement
+made inside a tool call: it reconciles (a blocking `channels/open` or
+`channels/close` per descriptor) before it answers, and this server serves
+one request at a time, so the answer cannot arrive until the tool returns.
+Without that rule the backlog would be retried on every refresh forever.
 
 Silence is not refusal either. A host that itemizes only the descriptors it
 changed leaves the rest unstated, and they are treated as pending, not

@@ -137,6 +137,13 @@ export interface PlatformAdapter {
   ): Promise<PublishResult>;
 
   /**
+   * Describe channels by id without enumerating the platform — for a channel
+   * the bot just joined, whose descriptor the server wants to register
+   * without a full discovery pass. Unknown ids are omitted. Optional.
+   */
+  describeChannels?(channelIds: string[]): Promise<ChannelDescriptor[]>;
+
+  /**
    * Best-effort typing indicator. Optional — platforms without a usable
    * typing API simply omit it.
    */

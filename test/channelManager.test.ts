@@ -432,7 +432,8 @@ test('a host that never answers keeps the channel usable, retries it only when a
   // Bounded: 200 unanswered channels do not grow the retry set past the cap.
   for (let i = 0; i < 200; i++) await manager.registerAdditional([desc(`zulip:s${i}`)]);
   const backlog = await manager.registerAdditional([], { retryBacklog: true });
-  assert.ok(backlog.local.length <= 100, `backlog stays capped (was ${backlog.local.length})`);
+  assert.equal(backlog.local.length, 100, 'exactly the cap, oldest dropped');
+  assert.equal(manager.getChannel('zulip:s0') !== undefined, true, 'an evicted channel stays usable, it is just no longer retried');
 });
 
 test('a host that itemizes only what it changed has not refused the rest (#20)', async () => {
@@ -495,4 +496,45 @@ test('two callers announcing the same new channel send one announcement (#20)', 
   ]);
   assert.equal(sent.length, 1, 'the second caller saw the first one in flight');
   assert.deepEqual([a.announced, b.announced].flat(), ['zulip:ops']);
+});
+
+test('a refusal that arrives on the retry is a refusal, not a contradiction (#20)', async () => {
+  // The descriptor is recorded before the announcement, so "already in
+  // allChannels" cannot mean "the host accepted it" — only a verdict can.
+  let answer: unknown = new Error('timed out');
+  const { manager } = announcing(() => answer);
+  const first = await manager.registerAdditional([desc('zulip:ops')]);
+  assert.deepEqual(first.local, ['zulip:ops']);
+
+  answer = { results: [{ id: 'zulip:ops', accepted: false, reason: 'not yours' }] };
+  const retry = await manager.registerAdditional([], { retryBacklog: true });
+  assert.deepEqual(retry.refused, ['zulip:ops']);
+  assert.deepEqual(retry.announced, [], 'never accepted, so this is not a host contradiction');
+  assert.equal(manager.getChannel('zulip:ops'), undefined);
+});
+
+test('retrying a refused channel does not forget the refusal when the retry goes unanswered (#20)', async () => {
+  let answer: unknown = { results: [{ id: 'zulip:ops', accepted: false }] };
+  const { manager, sent } = announcing(() => answer);
+  await manager.registerAdditional([desc('zulip:ops')]);
+  assert.equal(manager.getChannel('zulip:ops'), undefined);
+
+  answer = new Error('timed out');
+  const retried = await manager.registerAdditional([desc('zulip:ops')], { retryRefused: true });
+  assert.deepEqual(retried.refused, ['zulip:ops'], 'silence does not promote a refusal into a registration');
+  assert.deepEqual(retried.local, []);
+  assert.equal(manager.getChannel('zulip:ops'), undefined);
+
+  // Still refused: the automatic paths do not ask again.
+  const after = sent.length;
+  await manager.registerAdditional([desc('zulip:ops')]);
+  assert.equal(sent.length, after);
+});
+
+test('a host that acts on a pending channel has confirmed it (#20)', async () => {
+  const { manager, sent } = announcing(() => new Error('timed out'));
+  await manager.registerAdditional([desc('zulip:ops')]);
+  manager.confirmAnnounced('zulip:ops'); // the host opened or closed it
+  await manager.registerAdditional([], { retryBacklog: true });
+  assert.equal(sent.length, 1, 'nothing left to re-announce');
 });

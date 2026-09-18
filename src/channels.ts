@@ -187,19 +187,27 @@ export class ChannelManager {
     descriptors: ChannelDescriptor[],
     opts: { retryBacklog?: boolean; retryRefused?: boolean; timeoutMs?: number } = {},
   ): Promise<RegisterAdditionalResult> {
-    if (opts.retryRefused) this.refused.clear();
     const added: ChannelDescriptor[] = [];
     const refusedNow: string[] = [];
+    /** What each submitted descriptor was before this announcement, so the
+     *  verdict can be applied without inventing a state it never had. */
+    const before = new Map<string, 'confirmed' | 'pending' | 'refused' | 'new'>();
     for (const d of descriptors) {
       if (this.announcing.has(d.id)) continue; // already going out
       if (this.refused.has(d.id)) {
-        refusedNow.push(d.id);
+        if (!opts.retryRefused) {
+          refusedNow.push(d.id);
+          continue;
+        }
+        before.set(d.id, 'refused');
+        added.push(d);
         continue;
       }
       if (this.allChannels.has(d.id) && !this.unannounced.has(d.id)) {
-        this.allChannels.set(d.id, d); // refresh the local copy, nothing to announce
+        this.allChannels.set(d.id, d); // confirmed already; refresh the local copy
         continue;
       }
+      before.set(d.id, this.unannounced.has(d.id) ? 'pending' : 'new');
       added.push(d);
     }
     // The backlog is retried only where a caller can afford to wait — an
@@ -207,7 +215,11 @@ export class ChannelManager {
     // not carry it: that announcement sits in front of a delivery.
     if (opts.retryBacklog) {
       const queued = new Set(added.map((d) => d.id));
-      for (const [id, d] of this.unannounced) if (!queued.has(id) && !this.announcing.has(id)) added.push(d);
+      for (const [id, d] of this.unannounced) {
+        if (queued.has(id) || this.announcing.has(id)) continue;
+        before.set(id, 'pending');
+        added.push(d);
+      }
     }
     if (added.length === 0) return { announced: [], local: [], refused: refusedNow };
     if (!this.grant.has('channels.register')) {
@@ -216,11 +228,9 @@ export class ChannelManager {
     }
 
     // Recorded BEFORE the announcement goes out. A host that opens a channel
-    // from inside its own `channels/changed` handler (conhost reconciles
-    // before it answers) would otherwise be told `Unknown channel` for the
-    // very descriptor it is processing, and this server would answer its own
-    // `channels/open` the same way for as long as the answer is outstanding.
-    const known = new Set(added.filter((d) => this.allChannels.has(d.id)).map((d) => d.id));
+    // from inside its own `channels/changed` handler (agent-framework
+    // reconciles before it answers) would otherwise be told `Unknown channel`
+    // for the very descriptor it is processing.
     for (const d of added) {
       this.allChannels.set(d.id, d);
       this.announcing.add(d.id);
@@ -231,33 +241,39 @@ export class ChannelManager {
       const announced: string[] = [];
       const local: string[] = [];
       for (const d of added) {
+        const was = before.get(d.id) ?? 'new';
         switch (verdicts.get(d.id)) {
           case 'accepted':
             this.unannounced.delete(d.id);
+            this.refused.delete(d.id);
             announced.push(d.id);
             break;
           case 'refused':
-            // The host's answer, and the only thing that unregisters a
-            // channel here. Closing it too keeps the registry and the
-            // lifecycle from disagreeing about a channel it just rejected.
             this.unannounced.delete(d.id);
-            this.refused.add(d.id);
-            refusedNow.push(d.id);
-            if (!known.has(d.id)) {
-              this.allChannels.delete(d.id);
-              this.openChannels.delete(d.id);
-              this.lastIncoming.delete(d.id);
-            } else {
+            if (was === 'confirmed') {
+              // The host accepted this one earlier and is now refusing it.
+              // Unregistering it here would leave delivery running against a
+              // channel the registry no longer has; keep it and say so.
               console.error(`host refused ${d.id}, which it had already accepted; keeping it registered`);
               announced.push(d.id);
-              this.refused.delete(d.id);
-              refusedNow.pop();
+              break;
             }
+            this.refused.add(d.id);
+            refusedNow.push(d.id);
+            this.allChannels.delete(d.id);
+            this.openChannels.delete(d.id);
+            this.lastIncoming.delete(d.id);
             break;
           default:
             // Not in the itemization at all: a host that answers only for
             // what it changed has said nothing about this one. Silence is
-            // not a refusal — keep it and ask again later.
+            // not a refusal — and it is not permission either, so a channel
+            // that was refused before stays refused.
+            if (was === 'refused') {
+              this.restoreRefusal(d.id);
+              refusedNow.push(d.id);
+              break;
+            }
             this.queueUnannounced(d);
             local.push(d.id);
         }
@@ -267,11 +283,44 @@ export class ChannelManager {
     } catch (error) {
       const reason = error instanceof Error ? error.message : String(error);
       console.error(`Failed to announce ${added.length} channel(s) (${reason}); they stay usable here and are re-announced on the next refresh`);
-      for (const d of added) this.queueUnannounced(d);
-      return { announced: [], local: added.map((d) => d.id), refused: refusedNow, reason };
+      const local: string[] = [];
+      for (const d of added) {
+        if ((before.get(d.id) ?? 'new') === 'refused') {
+          this.restoreRefusal(d.id);
+          refusedNow.push(d.id);
+          continue;
+        }
+        this.queueUnannounced(d);
+        local.push(d.id);
+      }
+      return { announced: [], local, refused: refusedNow, reason };
     } finally {
       for (const d of added) this.announcing.delete(d.id);
     }
+  }
+
+  /**
+   * The host proved it knows a channel by acting on it — it opened or closed
+   * one this server is still waiting to hear about. Against a host that
+   * reconciles inside its own `channels/changed` handler that action is the
+   * only confirmation this server can ever get, because the answer to the
+   * announcement cannot arrive until the request this server is serving
+   * returns. Without this the backlog would be retried forever (#20 review).
+   */
+  confirmAnnounced(channelId: string): void {
+    if (this.unannounced.delete(channelId)) {
+      console.error(`[channels] ${channelId} confirmed by the host acting on it; dropping it from the announcement backlog`);
+    }
+    this.refused.delete(channelId);
+  }
+
+  /** Put a refused channel back the way a refusal leaves it. */
+  private restoreRefusal(channelId: string): void {
+    this.refused.add(channelId);
+    this.unannounced.delete(channelId);
+    this.allChannels.delete(channelId);
+    this.openChannels.delete(channelId);
+    this.lastIncoming.delete(channelId);
   }
 
   /** Queue a descriptor for re-announcement, oldest dropped past the cap. */

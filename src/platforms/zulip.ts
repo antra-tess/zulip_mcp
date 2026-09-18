@@ -209,6 +209,30 @@ export class ZulipAdapter implements PlatformAdapter {
   }
 
   /**
+   * Descriptors for the named stream channels, without enumerating the realm.
+   * The stream id comes from `get_stream_id` so the descriptor is the same
+   * shape discovery builds; a name Zulip does not resolve is omitted, and one
+   * outside the allowlist is never described.
+   */
+  async describeChannels(channelIds: string[]): Promise<ChannelDescriptor[]> {
+    const out: ChannelDescriptor[] = [];
+    for (const channelId of channelIds) {
+      if (isDmChannelIdLocal(channelId)) continue;
+      const name = streamNameOf(channelId);
+      if (!name || !this.filters.streamAllowed(name)) continue;
+      let streamId: number | undefined;
+      try {
+        const result = await this.zulipClient.streams.getStreamId({ stream: name });
+        if (result?.result === 'success' && typeof result.stream_id === 'number') streamId = result.stream_id;
+      } catch (error) {
+        console.error(`[zulip-mcp] could not resolve the stream id for #${name}:`, (error as Error).message);
+      }
+      out.push(this.streamDescriptor(name, streamId));
+    }
+    return out;
+  }
+
+  /**
    * DM conversations the bot has been part of recently. Zulip has no
    * "list my DM conversations" call; the recent DM history is the source.
    */

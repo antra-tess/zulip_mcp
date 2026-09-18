@@ -77,6 +77,7 @@ function fakeAdapter(withTyping = true): FakeAdapter {
     pageCap: Infinity,
     visible: [DESCRIPTOR],
     async discoverChannels() { return [...adapter.visible]; },
+    async describeChannels(channelIds: string[]) { return adapter.visible.filter((c) => channelIds.includes(c.id)); },
     async fetchHistory(channelId, query): Promise<ChannelHistoryPage> {
       adapter.historyCalls.push({ channelId, query });
       let rows = adapter.history.filter((m) => m.channelId === channelId);
@@ -124,11 +125,16 @@ const fakeTools = {
   /** Set by the server; the real runtime reports every message a tool sends. */
   onSent: null as null | ((sent: { messageId: string; channelId: string; content: string }) => void),
   /** Set by the server; the real runtime reports streams `listen` subscribed to. */
-  onSubscribed: null as null | ((streams: string[]) => void),
+  onSubscribed: null as null | ((streams: string[]) => unknown),
   async handleToolCall(name: string, args: Record<string, unknown>) {
     fakeTools.calls.push({ name, args });
     if (name === 'explode') throw new Error('boom');
     if (name === 'send_message') fakeTools.onSent?.({ messageId: '99', channelId: 'zulip:general', content: String(args.content ?? '') });
+    if (name === 'listen') {
+      // The real runtime subscribes, then awaits onSubscribed and reports it.
+      const registration = await fakeTools.onSubscribed?.(args.channels as string[]);
+      return { result: 'success', subscribed: args.channels, ...(registration ? { registration } : {}) };
+    }
     return { ok: true, name };
   },
   listResources() {
@@ -240,7 +246,11 @@ function harness(opts: HarnessOptions = {}): Harness {
               policy.reconcileOpens.push({ channelId: c.id, ok: false, detail: (err as Error).message });
             }
           }
-          host.sendResponse(req.id, { results: (p.added ?? []).map((c) => ({ id: c.id, accepted: true })) });
+          // The test may have torn the connection down while this host was
+          // still reconciling; that write is the harness's, not the server's.
+          try {
+            host.sendResponse(req.id, { results: (p.added ?? []).map((c) => ({ id: c.id, accepted: true })) });
+          } catch { /* connection closed */ }
         })();
       }
       else host.sendResponse(req.id, { results: (p.added ?? []).map((c) => ({ id: c.id, accepted: policy.changedAnswer === 'accept' })) });
@@ -1682,7 +1692,7 @@ test('a message that carries a descriptor for an unregistered channel registers 
   await h.close();
 });
 
-test('a channel the host never answered for stays usable here and is re-announced later (#20)', async () => {
+test('a channel the host never answered for stays usable here and is re-announced when the host answers again (#20)', async () => {
   const h = harness();
   await initialize(h, true);
   await settled(h);
@@ -1697,15 +1707,44 @@ test('a channel the host never answered for stays usable here and is re-announce
   assert.deepEqual(first.pendingAnnouncement, ['zulip:ops']);
   assert.match(first.note, /could not be announced/);
 
-  const opened = (await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:ops', type: 'zulip', address: {} })) as { channel: ChannelDescriptor };
-  assert.equal(opened.channel.id, 'zulip:ops', 'usable here even though the host never confirmed');
-
   // The host answers again: the next refresh re-announces what was pending.
   h.policy.changedAnswer = 'accept';
   const second = JSON.parse(((await h.host.sendRequest('tools/call', { name: 'refresh_channels', arguments: {} })) as { content: { text: string }[] }).content[0].text) as
     { added: string[]; note: string };
   assert.deepEqual(second.added, ['zulip:ops']);
   assert.match(second.note, /Registered 1 newly visible channel/);
+
+  // And a third refresh has nothing left to say.
+  const third = JSON.parse(((await h.host.sendRequest('tools/call', { name: 'refresh_channels', arguments: {} })) as { content: { text: string }[] }).content[0].text) as
+    { added: string[]; pendingAnnouncement?: string[] };
+  assert.deepEqual(third.added, []);
+  assert.equal(third.pendingAnnouncement, undefined);
+  await h.close();
+});
+
+test('a host that opens or closes a pending channel has confirmed it; the backlog does not grow forever (#20)', async () => {
+  // Against agent-framework the answer to an announcement made inside a tool
+  // call can never arrive (it reconciles first, and this server serves one
+  // request at a time). The host acting on the channel is the only
+  // confirmation available, so it has to count as one.
+  const h = harness({ announceTimeoutMs: 80 });
+  await initialize(h, true);
+  await settled(h);
+  h.policy.changedAnswer = 'reconcile';
+  h.adapter.visible = [DESCRIPTOR, LATE_STREAM];
+
+  const first = JSON.parse(((await h.host.sendRequest('tools/call', { name: 'refresh_channels', arguments: {} })) as { content: { text: string }[] }).content[0].text) as
+    { pendingAnnouncement?: string[] };
+  assert.deepEqual(first.pendingAnnouncement, ['zulip:ops'], 'the answer could not arrive in time');
+  await until(() => h.policy.reconcileOpens.length > 0, "the host's reconcile-time open is served");
+
+  // Second call: nothing pending, no second announcement, no stall.
+  const announcements = h.hostSaw.filter((r) => r.method === method.CHANNELS_CHANGED).length;
+  const second = JSON.parse(((await h.host.sendRequest('tools/call', { name: 'refresh_channels', arguments: {} })) as { content: { text: string }[] }).content[0].text) as
+    { added: string[]; pendingAnnouncement?: string[]; note: string };
+  assert.equal(second.pendingAnnouncement, undefined, 'the host proved it knows the channel by opening it');
+  assert.deepEqual(second.added, []);
+  assert.equal(h.hostSaw.filter((r) => r.method === method.CHANNELS_CHANGED).length, announcements, 'and it is not announced again');
   await h.close();
 });
 
@@ -1729,18 +1768,25 @@ test('a channel the host itemizes as refused is not registered, and refresh_chan
   await h.close();
 });
 
-test('listen registers the stream it just subscribed the bot to (#20)', async () => {
-  const h = harness();
+test('listen registers what it subscribed the bot to and reports how the host answered (#20)', async () => {
+  const h = harness({ announceTimeoutMs: 80 });
   await initialize(h, true);
   await settled(h);
   h.adapter.visible = [DESCRIPTOR, LATE_STREAM];
 
-  // The real runtime calls this after a successful subscription; the server
-  // wires it to registration.
-  fakeTools.onSubscribed!(['ops']);
-  await until(() => h.hostSaw.some((r) => r.method === method.CHANNELS_CHANGED && JSON.stringify(r.params).includes('zulip:ops')), 'announced after listen');
+  const ok = JSON.parse(((await h.host.sendRequest('tools/call', { name: 'listen', arguments: { channels: ['ops'] } })) as { content: { text: string }[] }).content[0].text) as
+    { registration: { announced: string[]; local: string[]; refused: string[] } };
+  assert.deepEqual(ok.registration.announced, ['zulip:ops']);
   const opened = (await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:ops', type: 'zulip', address: {} })) as { channel: ChannelDescriptor };
   assert.equal(opened.channel.id, 'zulip:ops');
+
+  // A host that cannot answer in time: the tool says so rather than logging it.
+  h.policy.changedAnswer = 'reconcile';
+  h.adapter.visible = [DESCRIPTOR, LATE_STREAM, { ...LATE_STREAM, id: 'zulip:infra', label: '#infra', address: { stream_name: 'infra', stream_id: 13 } }];
+  const stalled = JSON.parse(((await h.host.sendRequest('tools/call', { name: 'listen', arguments: { channels: ['infra'] } })) as { content: { text: string }[] }).content[0].text) as
+    { registration: { announced: string[]; local: string[] } };
+  assert.deepEqual(stalled.registration.local, ['zulip:infra'], 'the tool result carries the outcome; the note is the runtime\'s (see toolRuntime tests)');
+  await until(() => h.policy.reconcileOpens.some((o) => o.channelId === 'zulip:infra'), "the host's reconcile-time open is served");
   await h.close();
 });
 

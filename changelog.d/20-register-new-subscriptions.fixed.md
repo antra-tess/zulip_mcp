@@ -21,4 +21,9 @@
   knows every visible channel, and retries refused channels when the agent
   asks.
 - A reconnect clears the announcement backlog, so a channel pending for one
-  host is not announced to the next.
+  host is not announced to the next. A host that opens or closes a channel
+  has confirmed it and it leaves the backlog — against agent-framework that
+  is the only confirmation an announcement made inside a tool call can get,
+  and without it the backlog would be retried on every refresh forever.
+- `listen` registers only the streams it joined (no realm enumeration) and
+  reports how the host answered, instead of logging it to stderr.
