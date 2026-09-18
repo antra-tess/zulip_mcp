@@ -18,7 +18,7 @@ import {
   toFetchResult,
 } from "./content.js";
 import type { ZulipSession } from "./zulip-client.js";
-import { assertApiSuccess, dmChannelIdFor, fetchAround, fetchHistory, parseDmChannelId, renderReactions, type ReactionSummary, type ZulipMessage } from "./history.js";
+import { assertApiSuccess, dmChannelIdFor, fetchAround, fetchHistory, parseDmChannelId, renderReactions, type ReactionSummary, type ZulipMessage, editedTrailer } from './history.js';
 import { chunkMessage } from "./content.js";
 import { messageLineHead } from "./message-line.js";
 import { agentLineTimeFormatter } from "./timezone.js";
@@ -197,7 +197,7 @@ export function formatHistoryLines(
     const mark = m.id === anchorId ? " <<" : "";
     const att = m.attachments.length > 0 ? ` [attachments: ${m.attachments.map((a) => a.path).join(", ")}]` : "";
     const reactions = renderReactions(projectReactions(m.reactions, policy), selfUserId);
-    return `${head}${m.cleanContent}${att}${reactions}${mark}`;
+    return `${head}${m.cleanContent}${editedTrailer(m)}${att}${reactions}${mark}`;
   }).join("\n");
 }
 
@@ -222,6 +222,12 @@ export class ZulipToolRuntime {
   /** Set by the MCPL server: every message sent by a tool is reported here
    *  so a rollback checkpoint can undo it. */
   onSent: ((sent: SentRecord) => void) | null = null;
+  /** Called BEFORE delete_message is sent (the delete event can arrive before
+   *  the response does), so the adapter recognises the echo as its own. */
+  onDeleted: ((messageId: string) => void) | null = null;
+  /** Called when that delete_message failed: the message still exists, and
+   *  someone else's later deletion must surface. */
+  onDeleteFailed: ((messageId: string) => void) | null = null;
 
   private readonly uploader: Uploader | null;
   private readonly uploadPolicy: UploadPolicy;
@@ -674,11 +680,19 @@ export class ZulipToolRuntime {
       }
 
       case "delete_message": {
-        const result = await zulipClient.messages.deleteById({
-          message_id: args.message_id,
-        });
-        assertApiSuccess(result, `deleting message ${args.message_id}`);
-        return result;
+        // Noted before the call: the delete event can arrive before the
+        // response does. Un-noted on failure: nothing will echo.
+        this.onDeleted?.(String(args.message_id));
+        try {
+          const result = await zulipClient.messages.deleteById({
+            message_id: args.message_id,
+          });
+          assertApiSuccess(result, `deleting message ${args.message_id}`);
+          return result;
+        } catch (err) {
+          this.onDeleteFailed?.(String(args.message_id));
+          throw err;
+        }
       }
 
       case "list_streams": {

@@ -6,5 +6,6 @@
   effects on the same path, all towards verbatim text: HTML entities such as
   `&amp;` are no longer unescaped, `<https://example.com>` autolinks survive,
   author-typed literal `<p>`/`<br>` no longer turn into newlines, and CR/CRLF
-  line endings are normalised to LF. Rendered-HTML output (`formatMessages`)
-  still uses `cleanContent`.
+  line endings are normalised to LF. The message-edit path (#22) uses the same
+  raw-markdown treatment for the new and previous text. Rendered-HTML output
+  (`formatMessages`) still uses `cleanContent`.

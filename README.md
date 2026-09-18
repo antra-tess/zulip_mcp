@@ -52,6 +52,10 @@ Discord and Slack adapters that once lived here moved to those servers.
   plus the host-injected baseline; rollback checkpoints minted by every
   messaging tool; acknowledge by reaction; typing indicators routed to the
   active topic.
+- Edits, topic moves and deletions of messages the agent has seen arrive as
+  `[edited]` / `[moved]` / `[deleted]` lines carrying the message's own id
+  (`chat:edited` / `chat:deleted`, plus `chat:mention` when the edit now
+  addresses the bot); history marks edited messages `(edited)`.
 
 ## Installation
 
@@ -146,6 +150,46 @@ on an open channel are ordinary `channels/incoming` messages carrying only
 `chat:reaction` / `chat:reaction-remove` — a policy keyed on tags ignores
 them, but an unconditional "always wake on this channel" policy wakes on
 them too; add `"tagsNone": ["chat:reaction", "chat:reaction-remove"]` to it.
+
+### Edits, moves and deletions
+
+A change to a message is as visible as the message was. An edit, a topic
+move or a deletion of a message the host has accepted (or been offered) on
+an open channel, or of the bot's own message, surfaces on that channel as
+one line in the shared shape, carrying the message's own id:
+
+```
+[edited] [10:42 id=77] [#general > deploys] Ann: ship it tomorrow
+[moved] [10:43 id=77] [#general > deploys-2] Ann: topic changed from "deploys" (3 messages) [by user 12]
+[deleted] [10:44 id=77] [#general > deploys-2] Ann: message deleted — was: "ship it tomorrow"
+```
+
+On a closed channel only an addressed change is pushed — the mention the
+agent is about to answer was rewritten or deleted, or a DM it is reading
+changed — the same rule as for messages. A change to a message the host was
+never offered is dropped. Zulip re-renders (a link preview arriving) are
+not edits and never surface; the bot's own edits and deletions (rollback,
+`delete_message`) are its own doing and never surface either. A moved
+message is reported on the channel it left, naming where it went.
+
+The lines carry `chat:edited` (moves add `zulip:moved`) or `chat:deleted`,
+plus the same addressing tag a message would: `chat:mention` when the
+message mentions the bot as it now reads, `chat:dm` for a DM, else
+`chat:ambient` — so a tag-keyed wake policy wakes on an edit exactly when
+it would wake on the message, and a debounced ambient policy debounces
+ambient edits. An unconditional per-channel policy wakes on every change;
+add `"tagsNone": ["chat:edited", "chat:deleted"]` to it if that is unwanted.
+`metadata` carries `change`, `targetMessageId(s)`, `previousContent`,
+`previousTopic`, `movedToChannelId`, `actorId`, `mentioned` and
+`previouslyMentioned` (absent when only the post-change state could be
+read). A change line never sets `threadId` and never moves this server's
+reply routing: a moderator archiving an old message does not retarget the
+reply the agent is composing. A move into a stream the bot cannot see
+arrives from Zulip as a deletion and is reported as "no longer visible". Synthetic ids (`edit:77:…`) never advance the
+delivery watermark; the message's own id in the line is what `fetch_around`
+takes (a deleted id can no longer be fetched). History and backscroll
+render `(edited)` and `(moved)` trailers with `metadata.editedAt` /
+`movedAt`.
 
 ## Channels
 

@@ -220,3 +220,20 @@ test('without a realm there is no uploader: attachments error clearly and plain 
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test('delete_message notes the id before the call and un-notes it when the call fails (#22)', async () => {
+  const noted: string[] = [];
+  const failed: string[] = [];
+  const { tools } = runtime({
+    messages: {
+      deleteById: async ({ message_id }: { message_id: number }) =>
+        message_id === 7 ? { result: 'error', msg: 'You don\'t have permission to delete this message' } : { result: 'success' },
+    },
+  });
+  tools.onDeleted = (id) => noted.push(id);
+  tools.onDeleteFailed = (id) => failed.push(id);
+  await tools.handleToolCall('delete_message', { message_id: 5 });
+  await assert.rejects(tools.handleToolCall('delete_message', { message_id: 7 }));
+  assert.deepEqual(noted, ['5', '7'], 'noted before the call on both');
+  assert.deepEqual(failed, ['7'], 'only the refused one is un-noted');
+});

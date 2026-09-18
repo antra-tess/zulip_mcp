@@ -30,6 +30,11 @@ export interface ZulipRawMessage {
   /** The requesting user's flags — `mentioned` is Zulip's server-side verdict. */
   flags?: string[];
   reactions?: { emoji_name: string; emoji_code?: string; reaction_type?: string; user_id: number }[];
+  /** Unix seconds of the last content edit (content only since Zulip 10);
+   *  absent when never edited. */
+  last_edit_timestamp?: number;
+  /** Unix seconds of the last topic or stream move (Zulip 10+); absent when never moved. */
+  last_moved_timestamp?: number;
 }
 
 /** One emoji reaction bucket on a message. */
@@ -100,6 +105,10 @@ export interface ZulipMessage {
   attachments: AttachmentRef[];
   /** Reactions currently on the message (history fetches carry them; events do not). */
   reactions: ReactionSummary[];
+  /** When the content was last edited; null when never (history fetches carry it; events do not). */
+  editedAt: Date | null;
+  /** When the message was last moved to another topic or stream; null when never. */
+  movedAt: Date | null;
 }
 
 export interface HistoryQuery {
@@ -222,7 +231,14 @@ export function normalizeMessage(raw: ZulipRawMessage): ZulipMessage {
     wildcardMentioned: flags.includes('wildcard_mentioned'),
     attachments: extractZulipAttachments(raw.content),
     reactions: summarizeReactions(raw.reactions),
+    editedAt: typeof raw.last_edit_timestamp === 'number' ? new Date(raw.last_edit_timestamp * 1000) : null,
+    movedAt: typeof raw.last_moved_timestamp === 'number' ? new Date(raw.last_moved_timestamp * 1000) : null,
   };
+}
+
+/** ` (edited)` / ` (moved)` / both for a message changed since it was sent, else ''. */
+export function editedTrailer(m: Pick<ZulipMessage, 'editedAt' | 'movedAt'>): string {
+  return `${m.editedAt ? ' (edited)' : ''}${m.movedAt ? ' (moved)' : ''}`;
 }
 
 /**
@@ -346,7 +362,7 @@ export function toIncoming(
   identity: ZulipIdentity,
   extra: Record<string, unknown> = {},
 ): IncomingChannelMessage {
-  const content: TextContent[] = [{ type: 'text', text: m.cleanContent }];
+  const content: TextContent[] = [{ type: 'text', text: m.cleanContent + editedTrailer(m) }];
   const note = attachmentNote(m.attachments);
   if (note) content.push(note);
   return {
@@ -367,6 +383,8 @@ export function toIncoming(
       botUserId: identity.selfUserId !== null ? String(identity.selfUserId) : identity.sessionId,
       ...(m.attachments.length > 0 ? { attachments: m.attachments } : {}),
       ...(m.reactions.length > 0 ? { reactions: m.reactions } : {}),
+      ...(m.editedAt ? { editedAt: m.editedAt.toISOString() } : {}),
+      ...(m.movedAt ? { movedAt: m.movedAt.toISOString() } : {}),
       ...extra,
     },
   };

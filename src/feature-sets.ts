@@ -69,9 +69,14 @@ export const ZULIP_TAG_ONTOLOGY: TagOntology = {
     'chat:addressed', 'chat:mention', 'chat:dm', 'chat:private', 'chat:ambient',
     'chat:from-human', 'chat:from-bot',
     'chat:reaction', 'chat:reaction-remove',
+    'chat:edited', 'chat:deleted',
     'chat:has-image', 'chat:has-file',
   ],
   tags: {
+    'zulip:moved': {
+      desc: 'A message the agent has seen moved to another topic or stream (with chat:edited).',
+      facet: 'lifecycle',
+    },
     'zulip:wildcard-mention': {
       desc: 'An @all / @everyone / @stream wildcard reached the bot; never counts as addressed.',
       facet: 'addressing',
