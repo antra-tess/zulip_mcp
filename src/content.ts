@@ -271,6 +271,19 @@ export function cleanContent(html: string): string {
   return content;
 }
 
+/**
+ * Normalise raw markdown as returned by Zulip with `apply_markdown: false`.
+ * Deliberately NOT an HTML stripper: raw markdown contains no HTML of Zulip's
+ * making, so any `<...>` in it is the author's own text (XML in a fenced
+ * block, generics such as `Map<string, T>`, comparisons). Running
+ * `cleanContent()` on this path deleted all of it (#24). Mentions are already
+ * textual (`@**Name**`) and uploads are `[name](/user_uploads/...)`, so the
+ * only work left is line-ending and whitespace normalisation.
+ */
+export function cleanMarkdown(raw: string): string {
+  return raw.replace(/\r\n?/g, '\n').trim();
+}
+
 /** Zulip's default `max_message_length` realm setting. */
 export const ZULIP_MAX_MESSAGE_LENGTH = 10000;
 
