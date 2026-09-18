@@ -23,15 +23,17 @@ import type {
 import type {
   ChannelHistoryPage,
   ChannelHistoryQuery,
+  MessageChangeEvent,
   OnIncomingMessage,
+  OnMessageChange,
   OnReaction,
   OnSystemEvent,
   PlatformAdapter,
   PublishResult,
   RoutingHints,
 } from './adapter.js';
-import { ZulipEventLoop } from './zulip-events.js';
-import { chunkMessage } from '../content.js';
+import { ZulipEventLoop, type ZulipMessageChange } from './zulip-events.js';
+import { chunkMessage, cleanContent } from '../content.js';
 import { messageLineHead } from '../message-line.js';
 import { agentLineTimeFormatter } from '../timezone.js';
 import { uploadBlocks, withAttachmentLinks, type UploadPolicy, type Uploader } from '../uploads.js';
@@ -40,6 +42,7 @@ import {
   channelIdOf,
   dmCounterparts,
   dmDescriptor,
+  editedTrailer,
   fetchHistory,
   normalizeMessage,
   parseDmChannelId,
@@ -82,6 +85,38 @@ function isDmChannelIdLocal(channelId: string): boolean {
 function addressOf(descriptor: ChannelDescriptor | undefined): Partial<ZulipChannelAddress> {
   const address = descriptor?.address;
   return typeof address === 'object' && address !== null ? (address as Partial<ZulipChannelAddress>) : {};
+}
+
+/** A recently seen message, as the cache places reactions and changes. */
+interface SeenMessage {
+  channelId: string;
+  authorId: number;
+  authorName: string;
+  authorEmail: string;
+  isDm: boolean;
+  topic: string;
+  snippet: string | null;
+  /** Zulip's mention verdict as the message last read. */
+  mentioned: boolean;
+}
+
+/** How long a GET placing a change may take before the change is dropped
+ *  rather than wedging every change behind it. */
+const LOCATE_TIMEOUT_MS = 15_000;
+/** How long the bot's own deletion is remembered so its echo is dropped. */
+const SELF_DELETE_TTL_MS = 10 * 60_000;
+const SELF_DELETE_CAP = 500;
+/** How long a stream id that the list did not resolve is not asked about again. */
+const STREAM_REFRESH_HOLDOFF_MS = 60_000;
+/** How long "moved to a stream the bot cannot see" explains a following delete event. */
+const MOVED_AWAY_TTL_MS = 60_000;
+
+function withTimeout<T>(promise: Promise<T>, ms: number, what: string): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`${what} timed out after ${ms}ms`)), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => { if (timer) clearTimeout(timer); });
 }
 
 /** The live filters the adapter consults — the plane, or a stand-in. */
@@ -129,10 +164,25 @@ export class ZulipAdapter implements PlatformAdapter {
   private readonly formatTime: (d: Date) => string;
   /** DM conversations already described to the server, by channel id. */
   private knownDms = new Map<string, ChannelDescriptor>();
-  /** Recently seen messages, so a reaction can be placed without a round
-   *  trip: id → channel, author, snippet. Bounded; oldest evicted. */
-  private seen = new Map<number, { channelId: string; authorId: number; snippet: string | null }>();
+  /** Recently seen messages, so a reaction or an edit can be placed without
+   *  a round trip: id → channel, author, topic, snippet. Bounded; oldest
+   *  evicted. A deletion can only be placed from here — the message is gone. */
+  private seen = new Map<number, SeenMessage>();
   private static readonly SEEN_CAP = 2000;
+  /** Stream names by id, from discovery (refreshed on a miss): how a
+   *  deletion or a cross-stream move names a stream the cache does not know. */
+  private streamNamesById = new Map<number, string>();
+  /** Messages this adapter deleted itself (rollback, the delete tool), by
+   *  id → when: Zulip's delete event names no actor, so the echo of the
+   *  bot's own deletion is recognised here and dropped. Bounded and expiring
+   *  — a failed delete never echoes. */
+  private selfDeleted = new Map<number, number>();
+  /** When the stream list was last refreshed for an unknown id: a stream
+   *  the bot cannot see never resolves, and must not cost a refresh per event. */
+  private streamsRefreshedAt = 0;
+  /** Messages just moved to a stream the bot cannot see, by id → when: the
+   *  delete event Zulip sends for lost visibility is a vanishing, not a deletion. */
+  private movedAway = new Map<number, number>();
 
   constructor(
     private zulipClient: any,
@@ -170,6 +220,9 @@ export class ZulipAdapter implements PlatformAdapter {
       });
       const streams = result.streams || [];
       for (const stream of streams) {
+        if (typeof stream.stream_id === 'number' && typeof stream.name === 'string') {
+          this.streamNamesById.set(stream.stream_id, stream.name);
+        }
         if (!this.filters.streamAllowed(stream.name)) continue;
         channels.push(this.streamDescriptor(stream.name, stream.stream_id, {
           subscriber_count: stream.subscriber_count,
@@ -265,15 +318,29 @@ export class ZulipAdapter implements PlatformAdapter {
       const oldest = this.seen.keys().next().value;
       if (oldest !== undefined) this.seen.delete(oldest);
     }
-    this.seen.set(m.id, { channelId, authorId: m.authorId, snippet: snippetOf(m.cleanContent) });
+    this.seen.set(m.id, {
+      channelId,
+      authorId: m.authorId,
+      authorName: m.authorName,
+      authorEmail: m.authorEmail,
+      isDm: m.isDm,
+      topic: m.topic,
+      snippet: snippetOf(m.cleanContent),
+      mentioned: m.mentioned,
+    });
   }
 
   /** Where a message lives — from the recent-messages cache, else one GET. */
-  private async locate(messageId: number): Promise<{ channelId: string; authorId: number; snippet: string | null } | null> {
+  private async locate(messageId: number, purpose = 'a reaction'): Promise<SeenMessage | null> {
     const cached = this.seen.get(messageId);
     if (cached) return cached;
     try {
-      const result = await this.zulipClient.messages.getById({ message_id: messageId, apply_markdown: false });
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const result = await withTimeout<any>(
+        this.zulipClient.messages.getById({ message_id: messageId, apply_markdown: false }),
+        LOCATE_TIMEOUT_MS,
+        `GET message ${messageId}`,
+      );
       assertApiSuccess(result, `message ${messageId}`);
       const raw = result?.message as ZulipRawMessage | undefined;
       if (!raw) return null;
@@ -282,9 +349,178 @@ export class ZulipAdapter implements PlatformAdapter {
       this.remember(channelId, m);
       return this.seen.get(messageId) ?? null;
     } catch (err) {
-      console.error(`[zulip-mcp] could not resolve message ${messageId} for a reaction:`, (err as Error).message);
+      console.error(`[zulip-mcp] could not resolve message ${messageId} for ${purpose}:`, (err as Error).message);
       return null;
     }
+  }
+
+  /**
+   * The allowlists as the live event path applies them to a placed message.
+   * A DM is judged by its sender; the bot's own DM message has no sender to
+   * judge and is left to the server's per-conversation check.
+   */
+  private changeAllowed(where: SeenMessage): boolean {
+    if (where.isDm) {
+      if (this.identity.selfUserId !== null && where.authorId === this.identity.selfUserId) {
+        // The bot's own DM message: judged by whom it was sent to.
+        const counterparts = parseDmChannelId(where.channelId) ?? [];
+        return counterparts.some((id) => this.filters.dmAllowed({ id, email: '' }));
+      }
+      return this.filters.dmAllowed({ id: where.authorId, email: where.authorEmail });
+    }
+    return this.filters.streamAllowed(streamNameOf(where.channelId));
+  }
+
+  /**
+   * An edit, move or deletion from the event queue, placed and cleaned for
+   * the server. The bot's own edits are its own doing; a change someone
+   * else made to the bot's message is news. A deletion is placed from the
+   * cache alone (the message is gone), falling back to the stream the event
+   * names — a deleted DM the cache never saw cannot be placed and is dropped.
+   */
+  private async onZulipChange(change: ZulipMessageChange, emit: OnMessageChange): Promise<void> {
+    const self = this.identity.selfUserId;
+    if (change.kind === 'edit') {
+      if (self !== null && change.actorId === self) return;
+      const cached = this.seen.get(change.messageId) ?? null;
+      // A cache miss GETs the message as it reads NOW. For a content edit
+      // that is the right place; for a cross-stream move it is the stream
+      // the message went to, and the agent only ever saw it in the one it
+      // came from — which the event names.
+      const where = cached ?? await this.locate(change.messageId, 'an edit');
+      if (!where) return;
+      const crossStream = change.newStreamId !== null && !where.isDm;
+      const fromStream = crossStream && change.streamId !== null ? await this.streamNameById(change.streamId) : null;
+      // A cross-stream move of an uncached message whose origin cannot be
+      // named has nowhere honest to go: the GET only knows the destination.
+      if (crossStream && !cached && fromStream === null) {
+        console.error(`[zulip-mcp] dropping a move of message ${change.messageId}: origin stream ${change.streamId} unknown`);
+        return;
+      }
+      const fromChannelId = fromStream !== null ? zulipChannelId(fromStream) : where.channelId;
+      const placed: SeenMessage = { ...where, channelId: fromChannelId };
+      if (!this.changeAllowed(placed)) return;
+      const content = change.content !== null ? cleanContent(change.content) : null;
+      const previousContent = change.origContent !== null ? cleanContent(change.origContent) : null;
+      const topic = change.topic ?? where.topic;
+      const movedToStream = crossStream ? await this.streamNameById(Number(change.newStreamId)) : null;
+      const movedToChannelId = movedToStream !== null ? zulipChannelId(movedToStream) : null;
+      // Zulip's verdict on the new content replaces the cached one only when
+      // the content changed; a move keeps the mention it had (the event's
+      // flags are not relied on to be present for a move).
+      const mentioned = content !== null ? change.flags.includes('mentioned') : (where.mentioned || change.flags.includes('mentioned'));
+      // Keep the cache current: a later reaction or deletion reads the message
+      // as it now is. A move re-seats every co-moved message, not only the one
+      // acted on.
+      this.seen.set(change.messageId, {
+        ...where,
+        topic,
+        mentioned,
+        ...(content !== null ? { snippet: snippetOf(content) } : {}),
+        ...(movedToChannelId !== null ? { channelId: movedToChannelId } : {}),
+      });
+      if (change.topic !== null || movedToChannelId !== null) {
+        for (const id of change.messageIds) {
+          if (id === change.messageId) continue;
+          const co = this.seen.get(id);
+          if (co) this.seen.set(id, { ...co, topic, ...(movedToChannelId !== null ? { channelId: movedToChannelId } : {}) });
+        }
+      }
+      if (crossStream && movedToStream === null) {
+        const now = Date.now();
+        for (const [id, at] of this.movedAway) if (now - at > MOVED_AWAY_TTL_MS) this.movedAway.delete(id);
+        for (const id of change.messageIds) this.movedAway.set(id, now);
+      }
+      emit({
+        kind: content !== null ? 'edit' : 'move',
+        channelId: fromChannelId,
+        messageId: String(change.messageId),
+        messageIds: change.messageIds.map(String),
+        authorId: String(where.authorId),
+        authorName: where.authorName,
+        authorEmail: where.authorEmail,
+        actorId: change.actorId !== null ? String(change.actorId) : null,
+        topic,
+        previousTopic: change.topic !== null ? change.origTopic : null,
+        movedToChannelId,
+        content,
+        previousContent,
+        mentioned,
+        // The cache holds the pre-change verdict; a GET only the post-change one.
+        previouslyMentioned: cached ? cached.mentioned : null,
+        vanished: false,
+        isDM: where.isDm,
+        onOwnMessage: self !== null && where.authorId === self,
+        timestamp: new Date(change.editedAt * 1000),
+      });
+      return;
+    }
+
+    // The bot's own deletions (rollback, the delete tool) echo back without
+    // an actor: drop what this adapter deleted itself.
+    const ids = change.messageIds.filter((id) => !this.wasSelfDeleted(id));
+    if (ids.length === 0) return;
+    // A bulk deletion is reported under an id the cache can vouch for, so the
+    // line never shows one message's id with another's author and quote.
+    const placedId = ids.find((id) => this.seen.has(id)) ?? ids[0];
+    const cached = this.seen.get(placedId) ?? null;
+    const now = Date.now();
+    const vanished = ids.some((id) => {
+      const at = this.movedAway.get(id);
+      return at !== undefined && now - at <= MOVED_AWAY_TTL_MS;
+    });
+    for (const id of ids) { this.seen.delete(id); this.movedAway.delete(id); }
+    let event: MessageChangeEvent | null = null;
+    if (cached) {
+      if (!this.changeAllowed(cached)) return;
+      event = {
+        kind: 'delete',
+        channelId: cached.channelId,
+        messageId: String(placedId),
+        messageIds: ids.map(String),
+        authorId: String(cached.authorId),
+        authorName: cached.authorName,
+        authorEmail: cached.authorEmail,
+        actorId: null,
+        topic: change.topic ?? cached.topic,
+        previousTopic: null,
+        movedToChannelId: null,
+        content: null,
+        previousContent: cached.snippet,
+        // A deleted mention is the one the agent was about to answer.
+        mentioned: cached.mentioned,
+        previouslyMentioned: cached.mentioned,
+        vanished,
+        isDM: cached.isDm,
+        onOwnMessage: self !== null && cached.authorId === self,
+        timestamp: new Date(),
+      };
+    } else if (change.messageType === 'stream' && change.streamId !== null) {
+      const streamName = await this.streamNameById(change.streamId);
+      if (streamName === null || !this.filters.streamAllowed(streamName)) return;
+      event = {
+        kind: 'delete',
+        channelId: zulipChannelId(streamName),
+        messageId: String(placedId),
+        messageIds: ids.map(String),
+        authorId: null,
+        authorName: null,
+        authorEmail: null,
+        actorId: null,
+        topic: change.topic ?? '',
+        previousTopic: null,
+        movedToChannelId: null,
+        content: null,
+        previousContent: null,
+        mentioned: false,
+        previouslyMentioned: null,
+        vanished,
+        isDM: false,
+        onOwnMessage: false,
+        timestamp: new Date(),
+      };
+    }
+    if (event) emit(event);
   }
 
   /** The descriptor for a DM's conversation, remembered once described. */
@@ -355,8 +591,66 @@ export class ZulipAdapter implements PlatformAdapter {
   }
 
   async deleteMessage(_channelId: string, messageId: string): Promise<void> {
-    const result = await this.zulipClient.messages.deleteById({ message_id: Number(messageId) });
-    assertApiSuccess(result, `deleting message ${messageId}`);
+    const id = Number(messageId);
+    this.noteSelfDeleted(id);
+    try {
+      const result = await this.zulipClient.messages.deleteById({ message_id: id });
+      assertApiSuccess(result, `deleting message ${messageId}`);
+    } catch (err) {
+      this.selfDeleted.delete(id);
+      throw err;
+    }
+  }
+
+  /** A message the bot deleted through another path (the delete tool): its
+   *  delete event is the bot's own doing and must not surface. */
+  noteSelfDeleted(messageId: number): void {
+    if (!Number.isFinite(messageId)) return;
+    const now = Date.now();
+    for (const [id, at] of this.selfDeleted) {
+      if (now - at > SELF_DELETE_TTL_MS) this.selfDeleted.delete(id);
+    }
+    if (this.selfDeleted.size >= SELF_DELETE_CAP) {
+      const oldest = this.selfDeleted.keys().next().value;
+      if (oldest !== undefined) this.selfDeleted.delete(oldest);
+    }
+    this.selfDeleted.set(messageId, now);
+  }
+
+  forgetSelfDeleted(messageId: number): void {
+    this.selfDeleted.delete(messageId);
+  }
+
+  private wasSelfDeleted(messageId: number): boolean {
+    const at = this.selfDeleted.get(messageId);
+    if (at === undefined) return false;
+    this.selfDeleted.delete(messageId);
+    return Date.now() - at <= SELF_DELETE_TTL_MS;
+  }
+
+  /** A stream's name by id — from discovery, else one refresh of the list
+   *  (a stream created after startup). */
+  private async streamNameById(streamId: number): Promise<string | null> {
+    const known = this.streamNamesById.get(streamId);
+    if (known !== undefined) return known;
+    if (Date.now() - this.streamsRefreshedAt < STREAM_REFRESH_HOLDOFF_MS) return null;
+    this.streamsRefreshedAt = Date.now();
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const result = await withTimeout<any>(
+        this.zulipClient.streams.retrieve({ include_public: true, include_subscribed: true }),
+        LOCATE_TIMEOUT_MS,
+        'stream list refresh',
+      );
+      for (const stream of (result?.streams ?? []) as { stream_id?: unknown; name?: unknown }[]) {
+        if (typeof stream.stream_id === 'number' && typeof stream.name === 'string') {
+          this.streamNamesById.set(stream.stream_id, stream.name);
+        }
+      }
+    } catch (err) {
+      console.error(`[zulip-mcp] could not refresh the stream list for stream ${streamId}:`, (err as Error).message);
+    }
+    return this.streamNamesById.get(streamId) ?? null;
   }
 
   /**
@@ -441,7 +735,7 @@ export class ZulipAdapter implements PlatformAdapter {
       topic: m.topic,
       author: m.authorName,
       mentioned: m.mentioned,
-    }) + m.cleanContent).join('\n');
+    }) + m.cleanContent + editedTrailer(m)).join('\n');
 
     const label = dmIds ? `the direct-message conversation ${channelId}` : `Zulip #${streamNameOf(channelId)}`;
     return {
@@ -513,8 +807,27 @@ export class ZulipAdapter implements PlatformAdapter {
     if (fresh) console.error(`[zulip-mcp] subscribed to #${streamName} for channel ${channelId}`);
   }
 
-  startEvents(onMessage: OnIncomingMessage, onSystemEvent?: OnSystemEvent, onReaction?: OnReaction): void {
+  startEvents(
+    onMessage: OnIncomingMessage,
+    onSystemEvent?: OnSystemEvent,
+    onReaction?: OnReaction,
+    onMessageChange?: OnMessageChange,
+  ): void {
     this.eventLoop = new ZulipEventLoop();
+    // Changes are placed asynchronously (a cache miss costs one GET) but must
+    // reach the server in queue order: an edit followed by a deletion of the
+    // same message reads backwards otherwise. Every await in the chain is
+    // bounded (LOCATE_TIMEOUT_MS), so one hung GET delays, never wedges.
+    let changeChain: Promise<void> = Promise.resolve();
+    const changeHandler = onMessageChange
+      ? (change: ZulipMessageChange) => {
+          changeChain = changeChain
+            .then(() => this.onZulipChange(change, onMessageChange))
+            .catch((err) => {
+              console.error('[zulip-mcp] message change handling failed:', (err as Error).message);
+            });
+        }
+      : undefined;
     const reactionHandler = onReaction
       ? (ev: import('./zulip-events.js').ZulipReactionEvent) => {
           // The bot's own reactions are its own doing; only others' are news.
@@ -566,7 +879,7 @@ export class ZulipAdapter implements PlatformAdapter {
         ? this.streamDescriptor(m.streamName, typeof msg.stream_id === 'number' ? msg.stream_id : undefined)
         : undefined;
       onMessage(toIncoming(channelId, m, this.identity), descriptor);
-    }, onSystemEvent, reactionHandler).catch(error => {
+    }, onSystemEvent, reactionHandler, changeHandler).catch(error => {
       console.error('Zulip event loop failed:', error);
     });
   }

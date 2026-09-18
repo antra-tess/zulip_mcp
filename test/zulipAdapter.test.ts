@@ -9,6 +9,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { ZulipAdapter, type FilterView } from '../src/platforms/zulip.ts';
+import type { MessageChangeEvent } from '../src/platforms/adapter.ts';
 import type { ZulipRawMessage } from '../src/history.ts';
 import type { ChannelDescriptor } from '@animalabs/mcpl-core';
 
@@ -217,4 +218,240 @@ test('a descriptor built from an event without a stream_id still addresses the s
   await new Promise((r) => setTimeout(r, 50));
   adapter.stopEvents();
   assert.deepEqual(seen, [{ id: 'zulip:ops', address: { stream_name: 'ops', stream_id: undefined } }]);
+});
+
+test('edits, moves and deletions are placed, cleaned and filtered before reaching the server (#22)', async () => {
+  const events = [
+    // Ann's message arrives live (cached), then she edits it to mention the bot.
+    { id: 1, type: 'message', flags: [], message: { ...raw(5), content: 'first draft' } },
+    { id: 2, type: 'update_message', message_id: 5, message_ids: [5], user_id: 7, edit_timestamp: 1_700_000_900, orig_content: 'first draft', content: 'second draft @**Bot**', flags: ['mentioned'], stream_id: 7 },
+    // The bot's own edit is its own doing.
+    { id: 3, type: 'update_message', message_id: 5, message_ids: [5], user_id: SELF, edit_timestamp: 1_700_000_901, orig_content: 'x', content: 'y', flags: [], stream_id: 7 },
+    // A message the cache never saw: one GET places it.
+    { id: 4, type: 'update_message', message_id: 6, message_ids: [6], user_id: 7, edit_timestamp: 1_700_000_902, orig_content: 'm6', content: 'm6 fixed', flags: [], stream_id: 7 },
+    // A moderator moves Ann's message to another topic.
+    { id: 5, type: 'update_message', message_id: 5, message_ids: [5], user_id: 12, edit_timestamp: 1_700_000_903, orig_subject: 'deploys', subject: 'deploys-2', propagate_mode: 'change_one', stream_id: 7 },
+    // A cross-stream move of a message the cache evicted: the GET finds it
+    // in its NEW stream, but the agent only ever saw it in the old one, which
+    // the event names.
+    { id: 55, type: 'update_message', message_id: 700, message_ids: [700], user_id: 12, edit_timestamp: 1_700_000_904, orig_subject: 'deploys', stream_id: 7, new_stream_id: 8 },
+    // The (now edited, moved) message is deleted: placed from the cache.
+    { id: 6, type: 'delete_message', message_ids: [5], message_type: 'stream', stream_id: 7, topic: 'deploys-2' },
+    // A deletion the cache never saw: placed by the stream the event names.
+    { id: 7, type: 'delete_message', message_ids: [900, 901], message_type: 'stream', stream_id: 7, topic: 'old' },
+    // A deleted DM the cache never saw cannot be placed.
+    { id: 8, type: 'delete_message', message_id: 902, message_type: 'private' },
+    // A stream outside the allowlist: nothing.
+    { id: 9, type: 'delete_message', message_ids: [903], message_type: 'stream', stream_id: 8, topic: 't' },
+  ];
+  let polls = 0;
+  const getById: number[] = [];
+  const client = {
+    streams: { retrieve: async () => ({ result: 'success', streams: [{ name: 'general', stream_id: 7, subscriber_count: 2 }, { name: 'secret', stream_id: 8, subscriber_count: 1 }] }) },
+    messages: {
+      retrieve: async () => ({ result: 'success', messages: [], found_newest: true, found_oldest: true }),
+      getById: async ({ message_id }: { message_id: number }) => {
+        getById.push(message_id);
+        // A slow GET must not let later changes overtake this one.
+        if (message_id === 6) await new Promise((r) => setTimeout(r, 40));
+        return { result: 'success', message: message_id === 700 ? raw(700, { display_recipient: 'secret', stream_id: 8 }) : raw(message_id) };
+      },
+      deleteById: async () => ({ result: 'success' }),
+    },
+    queues: { register: async () => ({ queue_id: 'q1', last_event_id: -1 }) },
+    events: {
+      retrieve: async () => {
+        polls++;
+        if (polls === 1) return { events };
+        await new Promise((r) => setTimeout(r, 5));
+        return { events: [] };
+      },
+    },
+  };
+  const filters: FilterView = { streamAllowed: (s) => s === 'general', dmAllowed: () => true };
+  const adapter = new ZulipAdapter(client, SELF, 's', { filters, dmDiscoveryLimit: 0 });
+  await adapter.discoverChannels();
+  const delivered: string[] = [];
+  const changes: MessageChangeEvent[] = [];
+  const original = console.error;
+  console.error = () => {};
+  try {
+    adapter.startEvents((m) => { delivered.push(m.messageId); }, undefined, undefined, (c) => { changes.push(c); });
+    const deadline = Date.now() + 2000;
+    while (changes.length < 6 && Date.now() < deadline) await new Promise((r) => setTimeout(r, 5));
+    adapter.stopEvents();
+  } finally {
+    console.error = original;
+  }
+  assert.deepEqual(delivered, ['5'], 'the live message still reaches onMessage');
+  assert.deepEqual(getById, [6, 700], 'only the uncached messages cost a GET');
+  const view = changes.map((c) => ({
+    kind: c.kind, channelId: c.channelId, messageId: c.messageId, messageIds: c.messageIds, authorName: c.authorName, actorId: c.actorId,
+    topic: c.topic, previousTopic: c.previousTopic, movedTo: c.movedToChannelId, content: c.content, previousContent: c.previousContent,
+    mentioned: c.mentioned, wasMentioned: c.previouslyMentioned, onOwnMessage: c.onOwnMessage,
+  }));
+  assert.deepEqual(view, [
+    { kind: 'edit', channelId: 'zulip:general', messageId: '5', messageIds: ['5'], authorName: 'Ann', actorId: '7', topic: 'deploys', previousTopic: null, movedTo: null, content: 'second draft @**Bot**', previousContent: 'first draft', mentioned: true, wasMentioned: false, onOwnMessage: false },
+    // Placed by GET: only the post-edit state is known, so no previous verdict.
+    { kind: 'edit', channelId: 'zulip:general', messageId: '6', messageIds: ['6'], authorName: 'Ann', actorId: '7', topic: 'deploys', previousTopic: null, movedTo: null, content: 'm6 fixed', previousContent: 'm6', mentioned: false, wasMentioned: null, onOwnMessage: false },
+    // A move quotes nothing (the content did not change) and keeps the
+    // mention it had: the mention the agent is answering moved topics.
+    { kind: 'move', channelId: 'zulip:general', messageId: '5', messageIds: ['5'], authorName: 'Ann', actorId: '12', topic: 'deploys-2', previousTopic: 'deploys', movedTo: null, content: null, previousContent: null, mentioned: true, wasMentioned: true, onOwnMessage: false },
+    // Placed on the stream it left, pointing at the one it went to; the
+    // topic name did not change, so there is no previous topic.
+    { kind: 'move', channelId: 'zulip:general', messageId: '700', messageIds: ['700'], authorName: 'Ann', actorId: '12', topic: 'deploys', previousTopic: null, movedTo: 'zulip:secret', content: null, previousContent: null, mentioned: false, wasMentioned: null, onOwnMessage: false },
+    // The deleted message kept its last mention verdict: it is the one the agent was about to answer.
+    { kind: 'delete', channelId: 'zulip:general', messageId: '5', messageIds: ['5'], authorName: 'Ann', actorId: null, topic: 'deploys-2', previousTopic: null, movedTo: null, content: null, previousContent: 'second draft @**Bot**', mentioned: true, wasMentioned: true, onOwnMessage: false },
+    { kind: 'delete', channelId: 'zulip:general', messageId: '900', messageIds: ['900', '901'], authorName: null, actorId: null, topic: 'old', previousTopic: null, movedTo: null, content: null, previousContent: null, mentioned: false, wasMentioned: null, onOwnMessage: false },
+  ]);
+  assert.deepEqual(changes[0].timestamp, new Date(1_700_000_900_000), 'an edit is stamped with Zulip\'s edit time');
+  assert.equal(changes[0].authorEmail, 'ann@example.com', 'the sender travels with the change for the DM allowlist');
+});
+
+test('the bot\'s own deletions (rollback, the delete tool) do not echo back as changes', async () => {
+  const events = [
+    { id: 1, type: 'message', flags: [], message: raw(5) },
+    { id: 2, type: 'message', flags: [], message: raw(6) },
+    { id: 3, type: 'message', flags: [], message: raw(7) },
+  ];
+  let polls = 0;
+  let released: (() => void) | null = null;
+  const client = {
+    streams: { retrieve: async () => ({ result: 'success', streams: [{ name: 'general', stream_id: 7 }] }) },
+    messages: {
+      retrieve: async () => ({ result: 'success', messages: [], found_newest: true, found_oldest: true }),
+      getById: async ({ message_id }: { message_id: number }) => ({ result: 'success', message: raw(message_id) }),
+      deleteById: async ({ message_id }: { message_id: number }) => (message_id === 7 ? { result: 'error', msg: 'nope' } : { result: 'success' }),
+    },
+    queues: { register: async () => ({ queue_id: 'q1', last_event_id: -1 }) },
+    events: {
+      retrieve: async () => {
+        polls++;
+        if (polls === 1) return { events };
+        if (polls === 2) {
+          // The second batch waits for the test to delete first.
+          await new Promise<void>((r) => { released = r; });
+          return { events: [
+            { id: 4, type: 'delete_message', message_ids: [5], message_type: 'stream', stream_id: 7, topic: 'deploys' },   // rollback
+            { id: 5, type: 'delete_message', message_ids: [6], message_type: 'stream', stream_id: 7, topic: 'deploys' },   // delete tool
+            { id: 6, type: 'delete_message', message_ids: [7], message_type: 'stream', stream_id: 7, topic: 'deploys' },   // someone else: the bot's delete failed
+          ] };
+        }
+        await new Promise((r) => setTimeout(r, 5));
+        return { events: [] };
+      },
+    },
+  };
+  const adapter = new ZulipAdapter(client, SELF, 's', { dmDiscoveryLimit: 0 });
+  await adapter.discoverChannels();
+  const changes: MessageChangeEvent[] = [];
+  const original = console.error;
+  console.error = () => {};
+  try {
+    adapter.startEvents(() => {}, undefined, undefined, (c) => { changes.push(c); });
+    const deadline = Date.now() + 2000;
+    while (!released && Date.now() < deadline) await new Promise((r) => setTimeout(r, 5));
+    await adapter.deleteMessage('zulip:general', '5');
+    adapter.noteSelfDeleted(6);
+    await assert.rejects(adapter.deleteMessage('zulip:general', '7'));
+    released!();
+    while (changes.length < 1 && Date.now() < deadline) await new Promise((r) => setTimeout(r, 5));
+    await new Promise((r) => setTimeout(r, 30));
+    adapter.stopEvents();
+  } finally {
+    console.error = original;
+  }
+  assert.deepEqual(changes.map((c) => [c.kind, c.messageId]), [['delete', '7']], 'only the deletion the bot did not make surfaces');
+});
+
+test('bulk deletion, co-moved ids, unresolvable origins and vanishing moves (#22 round 2)', async () => {
+  const events = [
+    { id: 1, type: 'message', flags: [], message: raw(20) },
+    { id: 2, type: 'message', flags: [], message: raw(21) },
+    { id: 3, type: 'message', flags: [], message: raw(22) },
+    // A change_all move re-seats every co-moved message, not only the one acted on.
+    { id: 4, type: 'update_message', message_id: 20, message_ids: [20, 21, 22], user_id: 12, edit_timestamp: 1_700_001_000, orig_subject: 'deploys', subject: 'archive', propagate_mode: 'change_all', stream_id: 7 },
+    // Bulk deletion where the oldest id (Bob's, never cached) comes first: the
+    // line is reported under an id the cache can vouch for.
+    { id: 5, type: 'delete_message', message_ids: [19, 21], message_type: 'stream', stream_id: 7, topic: 'archive' },
+    // A cross-stream move of an uncached message whose origin stream is
+    // unknown: the GET only knows the destination, so it is dropped.
+    { id: 6, type: 'update_message', message_id: 800, message_ids: [800], user_id: 12, edit_timestamp: 1_700_001_001, orig_subject: 'x', stream_id: 99, new_stream_id: 8 },
+    // A move into a stream the bot cannot see, then Zulip's delete for lost
+    // visibility: a vanishing, not a deletion.
+    { id: 7, type: 'update_message', message_id: 22, message_ids: [22], user_id: 12, edit_timestamp: 1_700_001_002, orig_subject: 'archive', stream_id: 7, new_stream_id: 66 },
+    { id: 8, type: 'delete_message', message_ids: [22], message_type: 'stream', stream_id: 66, topic: 'archive' },
+  ];
+  let polls = 0;
+  let listCalls = 0;
+  const client = {
+    streams: { retrieve: async () => { listCalls++; return { result: 'success', streams: [{ name: 'general', stream_id: 7 }, { name: 'secret', stream_id: 8 }] }; } },
+    messages: {
+      retrieve: async () => ({ result: 'success', messages: [], found_newest: true, found_oldest: true }),
+      getById: async ({ message_id }: { message_id: number }) => ({ result: 'success', message: raw(message_id, { display_recipient: 'secret', stream_id: 8 }) }),
+    },
+    queues: { register: async () => ({ queue_id: 'q1', last_event_id: -1 }) },
+    events: {
+      retrieve: async () => {
+        polls++;
+        if (polls === 1) return { events };
+        await new Promise((r) => setTimeout(r, 5));
+        return { events: [] };
+      },
+    },
+  };
+  const adapter = new ZulipAdapter(client, SELF, 's', { dmDiscoveryLimit: 0 });
+  await adapter.discoverChannels();
+  const changes: MessageChangeEvent[] = [];
+  const original = console.error;
+  console.error = () => {};
+  try {
+    adapter.startEvents(() => {}, undefined, undefined, (c) => { changes.push(c); });
+    const deadline = Date.now() + 2000;
+    while (changes.length < 4 && Date.now() < deadline) await new Promise((r) => setTimeout(r, 5));
+    await new Promise((r) => setTimeout(r, 30));
+    adapter.stopEvents();
+  } finally {
+    console.error = original;
+  }
+  const view = changes.map((c) => ({ kind: c.kind, channelId: c.channelId, messageId: c.messageId, messageIds: c.messageIds, authorName: c.authorName, topic: c.topic, movedTo: c.movedToChannelId, previousContent: c.previousContent, vanished: c.vanished }));
+  assert.deepEqual(view, [
+    { kind: 'move', channelId: 'zulip:general', messageId: '20', messageIds: ['20', '21', '22'], authorName: 'Ann', topic: 'archive', movedTo: null, previousContent: null, vanished: false },
+    // Reported under 21 (cached, now in `archive`), with 19 still listed; never Ann's name on Bob's id.
+    { kind: 'delete', channelId: 'zulip:general', messageId: '21', messageIds: ['19', '21'], authorName: 'Ann', topic: 'archive', movedTo: null, previousContent: 'm21', vanished: false },
+    { kind: 'move', channelId: 'zulip:general', messageId: '22', messageIds: ['22'], authorName: 'Ann', topic: 'archive', movedTo: null, previousContent: null, vanished: false },
+    { kind: 'delete', channelId: 'zulip:general', messageId: '22', messageIds: ['22'], authorName: 'Ann', topic: 'archive', movedTo: null, previousContent: 'm22', vanished: true },
+  ]);
+  assert.equal(listCalls, 2, 'unknown stream ids cost one list refresh, then a hold-off — not one per event');
+});
+
+test('a change to the bot\'s own DM message is judged by whom it was sent to', async () => {
+  const events = [
+    { id: 1, type: 'message', flags: [], message: dm(30, SELF) },
+    { id: 2, type: 'update_message', message_id: 30, message_ids: [30], user_id: 42, edit_timestamp: 1_700_002_000, orig_subject: '', subject: 'renamed', stream_id: undefined },
+  ];
+  let polls = 0;
+  const client = {
+    streams: { retrieve: async () => ({ result: 'success', streams: [] }) },
+    messages: { retrieve: async () => ({ result: 'success', messages: [], found_newest: true, found_oldest: true }), getById: async () => ({ result: 'error' }) },
+    queues: { register: async () => ({ queue_id: 'q1', last_event_id: -1 }) },
+    events: { retrieve: async () => { polls++; if (polls === 1) return { events }; await new Promise((r) => setTimeout(r, 5)); return { events: [] }; } },
+  };
+  const run = async (filters: FilterView) => {
+    polls = 0;
+    const adapter = new ZulipAdapter(client, SELF, 's', { dmDiscoveryLimit: 0, filters });
+    const changes: MessageChangeEvent[] = [];
+    const original = console.error;
+    console.error = () => {};
+    try {
+      adapter.startEvents(() => {}, undefined, undefined, (c) => { changes.push(c); });
+      await new Promise((r) => setTimeout(r, 60));
+      adapter.stopEvents();
+    } finally {
+      console.error = original;
+    }
+    return changes.length;
+  };
+  assert.equal(await run({ streamAllowed: () => true, dmAllowed: (u) => u.id === 42 || u.id === 7 }), 1, 'a counterpart is allowlisted');
+  assert.equal(await run({ streamAllowed: () => true, dmAllowed: (u) => u.id === 999 }), 0, 'no counterpart is: the bot\'s own authorship is no pass');
 });

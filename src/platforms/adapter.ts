@@ -93,6 +93,56 @@ export interface ReactionEvent {
 
 export type OnReaction = (event: ReactionEvent) => void;
 
+/**
+ * A message the agent may have seen was edited, moved to another topic or
+ * stream, or deleted — resolved to the channel the message lived in.
+ * Adapters drop the bot's own edits before invoking the callback; a change
+ * someone else made to the bot's message is news (`onOwnMessage`).
+ */
+export interface MessageChangeEvent {
+  kind: 'edit' | 'move' | 'delete';
+  channelId: string;
+  /** The changed message; a move or bulk delete names the one acted on and
+   *  lists every affected id in `messageIds`. */
+  messageId: string;
+  messageIds: string[];
+  /** The message's author, when known (a deleted message no longer in the
+   *  adapter's cache is placed by stream alone). */
+  authorId: string | null;
+  authorName: string | null;
+  authorEmail: string | null;
+  /** Who made the change; null for a server-side change or when unknown
+   *  (Zulip's delete event names no actor). */
+  actorId: string | null;
+  /** The topic after the change; '' for a direct message. */
+  topic: string;
+  /** The topic before a move; null when the topic did not change. */
+  previousTopic: string | null;
+  /** The channel the message moved to, when it left this one. */
+  movedToChannelId: string | null;
+  /** The content after an edit, cleaned like a delivered message; null for a
+   *  move or a delete. */
+  content: string | null;
+  /** The content before the change, cleaned; null when unknown. */
+  previousContent: string | null;
+  /** The bot is mentioned in the message as it now reads (Zulip's verdict). */
+  mentioned: boolean;
+  /** The bot was mentioned in the message as it read before the change, as
+   *  far as the adapter knows (a deleted message keeps its last verdict);
+   *  null when the message was not in the adapter's cache and only its
+   *  post-change state could be read. */
+  previouslyMentioned: boolean | null;
+  /** A deletion event for a message that had just moved to a stream the bot
+   *  cannot see: Zulip reports lost visibility as a deletion. */
+  vanished: boolean;
+  isDM: boolean;
+  /** The changed message was authored by the bot. */
+  onOwnMessage: boolean;
+  timestamp: Date;
+}
+
+export type OnMessageChange = (event: MessageChangeEvent) => void;
+
 /** History request against one channel, in the platform's own id space. */
 export interface ChannelHistoryQuery {
   limit: number;
@@ -183,6 +233,12 @@ export interface PlatformAdapter {
   /** Delete one of the bot's own messages (rollback). */
   deleteMessage?(channelId: string, messageId: string): Promise<void>;
 
+  /** A message the bot deleted through another path (a tool) — its delete
+   *  event is the bot's own doing and must not surface as a change. */
+  noteSelfDeleted?(messageId: number): void;
+  /** That deletion failed: the message still exists. */
+  forgetSelfDeleted?(messageId: number): void;
+
   /**
    * Start delivering real-time messages. Adapters filter the bot's own
    * messages before invoking the callback.
@@ -190,8 +246,15 @@ export interface PlatformAdapter {
    * `onSystemEvent` (optional, and optional for adapters to use) receives
    * out-of-band conditions — delivery gaps, degraded polling — so the host
    * can surface them to the agent instead of losing them in stderr.
+   * `onMessageChange` (optional, and optional for adapters to use) receives
+   * edits, moves and deletions of messages already delivered.
    */
-  startEvents(onMessage: OnIncomingMessage, onSystemEvent?: OnSystemEvent, onReaction?: OnReaction): void;
+  startEvents(
+    onMessage: OnIncomingMessage,
+    onSystemEvent?: OnSystemEvent,
+    onReaction?: OnReaction,
+    onMessageChange?: OnMessageChange,
+  ): void;
 
   /** Stop event delivery and release platform resources. */
   stopEvents(): void;

@@ -1,10 +1,10 @@
 /**
  * Zulip Event Loop — Real-time message delivery via long-polling.
  *
- * Registers an event queue for message events, polls for new messages
- * (stream messages and direct messages alike), and routes them through a
- * callback. Handles queue expiry recovery
- * and graceful shutdown.
+ * Registers an event queue for message, reaction, edit and delete events,
+ * polls for them (stream messages and direct messages alike), and routes
+ * each kind through its callback. Handles queue expiry recovery and
+ * graceful shutdown.
  *
  * Failure semantics — grounded in what the vendored client stack
  * (`zulip-js@2.1.0` → `isomorphic-fetch` → `node-fetch@2.7.0`) actually does:
@@ -70,12 +70,86 @@ export interface ZulipReactionEvent {
 export type OnZulipReaction = (event: ZulipReactionEvent) => void;
 
 /**
+ * An `update_message` event as the queue delivers it — the fields this loop
+ * reads. Zulip sends `orig_content`/`content` only when the content changed,
+ * `orig_subject`/`subject` only when the topic changed, and `new_stream_id`
+ * only when the message moved to another stream. `rendering_only` marks a
+ * re-render (a link preview arriving, an inline image resolving) that
+ * changed nothing the author wrote.
+ */
+export interface ZulipUpdateMessageEvent {
+  message_id: number;
+  /** Every message the change touched — many for a topic move with `propagate_mode`. */
+  message_ids?: number[];
+  /** Who made the change — the acting user, despite the published docs
+   *  calling it "the user who sent the message" (zerver/actions/
+   *  message_edit.py sets it from the editor); null for a server-side change. */
+  user_id?: number | null;
+  edit_timestamp?: number;
+  rendering_only?: boolean;
+  content?: string;
+  orig_content?: string;
+  subject?: string;
+  orig_subject?: string;
+  propagate_mode?: string;
+  stream_id?: number;
+  new_stream_id?: number;
+  /** The receiving user's flags after the change — `mentioned` is Zulip's
+   *  verdict on the NEW content. */
+  flags?: string[];
+}
+
+/** A `delete_message` event as the queue delivers it. */
+export interface ZulipDeleteMessageEvent {
+  message_id?: number;
+  message_ids?: number[];
+  message_type?: 'stream' | 'private';
+  stream_id?: number;
+  topic?: string;
+}
+
+/** A change to an existing message, as the loop forwards it. */
+export type ZulipMessageChange =
+  | {
+      kind: 'edit';
+      messageId: number;
+      messageIds: number[];
+      actorId: number | null;
+      /** Unix seconds. */
+      editedAt: number;
+      /** New raw content; null when only the topic or stream changed. */
+      content: string | null;
+      origContent: string | null;
+          /** New topic; null when the topic name did not change (Zulip omits
+       *  `subject` for a stream-only move but still sends `orig_subject`). */
+      topic: string | null;
+      /** The topic before any move (topic or stream); null for a content edit. */
+      origTopic: string | null;
+      streamId: number | null;
+      /** Set when the message moved to another stream. */
+      newStreamId: number | null;
+      flags: string[];
+    }
+  | {
+      kind: 'delete';
+      messageIds: number[];
+      messageType: 'stream' | 'private';
+      streamId: number | null;
+      topic: string | null;
+    };
+
+export type OnZulipMessageChange = (change: ZulipMessageChange) => void;
+
+/**
  * The shape zulip-js `events.retrieve` resolves to. On success it carries an
  * `events` array; on a queue-level failure (e.g. BAD_EVENT_QUEUE_ID) it
  * resolves — NOT rejects — to a `{ result: 'error', code, msg }` object.
  */
 export interface ZulipRetrieveResponse {
-  events?: ({ id: number; type: string; message?: ZulipEventMessage; flags?: string[] } & Partial<ZulipReactionEvent>)[];
+  events?: ({ id: number; type: string; message?: ZulipEventMessage; flags?: string[] }
+    & Partial<ZulipReactionEvent>
+    & Partial<ZulipUpdateMessageEvent>
+    & Partial<ZulipDeleteMessageEvent>)[];
   result?: string;
   code?: string;
   msg?: string;
@@ -154,17 +228,20 @@ export class ZulipEventLoop {
    * `onSystemEvent` (optional) receives out-of-band conditions the agent
    * should know about: 'gap' (messages may have been missed across a queue
    * re-register), 'degraded' (polling is failing repeatedly), and 'recovered'
-   * (polling is healthy again).
+   * (polling is healthy again). `onChange` (optional) receives edits, topic
+   * moves and deletions of existing messages; without it those event types
+   * are still registered but dropped.
    */
   async start(
     zulipClient: ZulipEventClient,
     onMessage: OnZulipMessage,
     onSystemEvent?: OnSystemEvent,
     onReaction?: OnZulipReaction,
+    onChange?: OnZulipMessageChange,
   ): Promise<void> {
     while (!this.stopped) {
       try {
-        await this.pollLoop(zulipClient, onMessage, onSystemEvent, onReaction);
+        await this.pollLoop(zulipClient, onMessage, onSystemEvent, onReaction, onChange);
       } catch (error) {
         if (this.stopped) return;
         console.error('Zulip event loop error, restarting in 5s:', error);
@@ -185,16 +262,25 @@ export class ZulipEventLoop {
     onMessage: OnZulipMessage,
     onSystemEvent?: OnSystemEvent,
     onReaction?: OnZulipReaction,
+    onChange?: OnZulipMessageChange,
   ): Promise<void> {
     // Register event queue.
     // Two zulip-js quirks to work around:
     //   - Booleans crash FormData serialization; pass "true"/"false" as strings.
     //   - Arrays must be raw JS arrays (the library JSON.stringifies them);
     //     pre-stringified JSON produces "event_types is not a list" at Zulip.
+    // Zulip delivers exactly the registered types: without 'update_message'
+    // and 'delete_message' an edit to a message the agent was mentioned in
+    // never arrived at all (#22).
+    // `client_capabilities` must be pre-stringified: zulip-js JSON-encodes
+    // arrays only, and a raw object goes over the wire as "[object Object]".
+    // Without bulk_message_deletion a topic deletion is one event per
+    // message.
     const registration = await zulipClient.queues.register({
-      event_types: ['message', 'reaction'],
+      event_types: ['message', 'reaction', 'update_message', 'delete_message'],
       all_public_streams: 'true',
       apply_markdown: 'false',
+      client_capabilities: JSON.stringify({ bulk_message_deletion: true }),
     });
 
     this.queueId = registration.queue_id;
@@ -285,6 +371,60 @@ export class ZulipEventLoop {
               });
             } catch (handlerError) {
               console.error('Zulip event loop: onReaction handler threw:', handlerError);
+            }
+            continue;
+          }
+
+          if (event.type === 'update_message') {
+            // A re-render is not an edit: nothing the author wrote changed.
+            if (onChange && typeof event.message_id === 'number' && event.rendering_only !== true) {
+              const contentChanged = typeof event.orig_content === 'string';
+              // `orig_subject` accompanies every move; `subject` only a topic rename.
+              const moved = typeof event.orig_subject === 'string';
+              const topicChanged = moved && typeof event.subject === 'string' && event.subject !== event.orig_subject;
+              const streamChanged = typeof event.new_stream_id === 'number';
+              if (contentChanged || topicChanged || streamChanged) {
+                try {
+                  onChange({
+                    kind: 'edit',
+                    messageId: event.message_id,
+                    messageIds: Array.isArray(event.message_ids) && event.message_ids.length > 0
+                      ? event.message_ids.filter((id): id is number => typeof id === 'number')
+                      : [event.message_id],
+                    actorId: typeof event.user_id === 'number' ? event.user_id : null,
+                    editedAt: typeof event.edit_timestamp === 'number' ? event.edit_timestamp : Math.floor(Date.now() / 1000),
+                    content: contentChanged && typeof event.content === 'string' ? event.content : null,
+                    origContent: contentChanged ? String(event.orig_content) : null,
+                    topic: topicChanged ? String(event.subject) : null,
+                    origTopic: moved ? String(event.orig_subject) : null,
+                    streamId: typeof event.stream_id === 'number' ? event.stream_id : null,
+                    newStreamId: streamChanged ? Number(event.new_stream_id) : null,
+                    flags: Array.isArray(event.flags) ? event.flags : [],
+                  });
+                } catch (handlerError) {
+                  console.error('Zulip event loop: onChange handler threw:', handlerError);
+                }
+              }
+            }
+            continue;
+          }
+
+          if (event.type === 'delete_message') {
+            const ids = Array.isArray(event.message_ids)
+              ? event.message_ids.filter((id): id is number => typeof id === 'number')
+              : typeof event.message_id === 'number' ? [event.message_id] : [];
+            if (onChange && ids.length > 0) {
+              try {
+                onChange({
+                  kind: 'delete',
+                  messageIds: ids,
+                  messageType: event.message_type === 'private' ? 'private' : 'stream',
+                  streamId: typeof event.stream_id === 'number' ? event.stream_id : null,
+                  topic: typeof event.topic === 'string' ? event.topic : null,
+                });
+              } catch (handlerError) {
+                console.error('Zulip event loop: onChange handler threw:', handlerError);
+              }
             }
             continue;
           }

@@ -62,7 +62,8 @@ import type { AttachmentRef } from './content.js';
 import { agentLineTimeFormatter } from './timezone.js';
 import { CapabilityGrant } from './grant.js';
 import { StateTracker } from './state.js';
-import type { PlatformAdapter, PlatformSystemEvent, ReactionEvent } from './platforms/adapter.js';
+import type { MessageChangeEvent, PlatformAdapter, PlatformSystemEvent, ReactionEvent } from './platforms/adapter.js';
+import { messageLineHead } from './message-line.js';
 import { CHAT_TAGS } from '@animalabs/mcpl-core';
 import type { ReactionSummary } from './history.js';
 import { toolDefinitions } from './tools.js';
@@ -155,6 +156,8 @@ export class ZulipMcplServer {
   private readonly catchupLimit: number;
   private readonly missedBlockMaxChars: number;
   private readonly formatTime: (d: Date) => string;
+  /** Distinguishes change markers minted within the same second. */
+  private changeSeq = 0;
   private readonly attributeDelivery: boolean;
   private readonly announceTimeoutMs: number;
   private readonly filters: FiltersPlane | null;
@@ -226,6 +229,10 @@ export class ZulipMcplServer {
     // Only those streams: a realm enumeration here would cost a full stream
     // list plus a DM-history fetch to announce what the caller already named.
     this.tools.onSubscribed = (streams) => this.registerSubscribed(streams);
+    // A deletion made through the tool surface echoes back as a delete event
+    // without an actor; the adapter recognises its own.
+    this.tools.onDeleted = (messageId) => this.adapter.noteSelfDeleted?.(Number(messageId));
+    this.tools.onDeleteFailed = (messageId) => this.adapter.forgetSelfDeleted?.(Number(messageId));
   }
 
   /** True when the connected peer negotiated MCPL. */
@@ -1567,6 +1574,11 @@ export class ZulipMcplServer {
           console.error('[zulip-mcp] reaction handling failed:', (err as Error).message);
         });
       },
+      (change) => {
+        void this.onMessageChange(change).catch((err) => {
+          console.error('[zulip-mcp] message change handling failed:', (err as Error).message);
+        });
+      },
     );
   }
 
@@ -1616,6 +1628,107 @@ export class ZulipMcplServer {
     }
   }
 
+  /**
+   * An edit, move or deletion is as visible as its message was. On an open
+   * channel every message is delivered, so a change to one the host has
+   * accepted (at or below the watermark), one that addresses the bot, or
+   * one the bot wrote is delivered too. On a closed channel only addressed
+   * traffic is pushed, so only an addressed change is — the mention the
+   * agent is about to answer was rewritten, or the DM it is reading changed.
+   * A change to a message the host never accepted is noise: it arrives
+   * already changed if it arrives at all. The synthetic id never advances a
+   * watermark; the line carries the message's own id for fetch_around.
+   */
+  private async onMessageChange(ev: MessageChangeEvent): Promise<void> {
+    if (this.isMuted(ev.channelId) || !this.isAllowed(ev.channelId)) return;
+    if (!this.mcplActive || !this.grant.isFeatureSetActive(MESSAGING_FEATURE_SET)) return;
+    const addressed = ev.mentioned || ev.isDM;
+    const open = this.channelManager.isOpen(ev.channelId);
+    if (!open && !addressed) return;
+    if (open && !addressed && !ev.onOwnMessage) {
+      // Accepted (at or below the watermark) or offered and not yet accepted
+      // (held): "post, then fix the typo" lands before the host's acceptance
+      // round trip and must not be lost.
+      const watermark = this.delivery.watermark(ev.channelId) ?? 0;
+      const held = new Set(this.delivery.heldIds(ev.channelId));
+      const ids = ev.messageIds.map(Number).filter((n) => Number.isFinite(n));
+      if (!ids.some((n) => n <= watermark || held.has(n))) return;
+    }
+
+    const head = messageLineHead({
+      id: ev.messageId,
+      time: Number.isNaN(ev.timestamp.getTime()) ? '' : this.formatTime(ev.timestamp),
+      stream: ev.isDM ? null : (ev.channelId.startsWith('zulip:') ? ev.channelId.slice('zulip:'.length) : ev.channelId),
+      topic: ev.topic,
+      author: ev.authorName ?? 'unknown author',
+      mentioned: ev.mentioned,
+    });
+    const others = ev.messageIds.length > 1 ? ` (${ev.messageIds.length} messages)` : '';
+    const byOther = ev.actorId !== null && ev.actorId !== ev.authorId ? ` [by user ${ev.actorId}]` : '';
+    const wasQuoted = ev.previousContent ? ` — was: "${ev.previousContent}"` : '';
+    const movedTo = ev.movedToChannelId ? ` (now in ${ev.movedToChannelId})` : '';
+    const fromTopic = ev.previousTopic !== null ? ` [moved from topic "${ev.previousTopic}"${movedTo}]` : (movedTo ? ` [moved${movedTo}]` : '');
+    let line: string;
+    if (ev.kind === 'edit') {
+      line = `[edited] ${head}${ev.content ?? ''}${fromTopic}${byOther}`;
+    } else if (ev.kind === 'move') {
+      line = `[moved] ${head}topic changed${ev.previousTopic !== null ? ` from "${ev.previousTopic}"` : ''}${movedTo}${others}${byOther}`;
+    } else if (ev.vanished) {
+      line = `[deleted] ${head}no longer visible to the bot (moved to a stream it cannot see)${others}${wasQuoted}`;
+    } else {
+      line = `[deleted] ${head}message deleted${others}${wasQuoted}`;
+    }
+    const tag = ev.kind === 'delete' ? CHAT_TAGS.deleted : CHAT_TAGS.edited;
+    // Zulip's edit time has one-second resolution and the host dedupes
+    // pushes by eventId: a counter keeps two edits within a second apart.
+    const stamp = `${ev.timestamp.getTime()}.${++this.changeSeq}`;
+    const message: IncomingChannelMessage = {
+      channelId: ev.channelId,
+      messageId: `${ev.kind}:${ev.messageId}:${stamp}`,
+      // No threadId: a marker about a message is not the conversation and
+      // must not retarget the reply the agent is composing (see
+      // ChannelManager.onIncomingMessage).
+      author: { id: ev.authorId ?? 'unknown', name: ev.authorName ?? 'unknown author' },
+      timestamp: ev.timestamp.toISOString(),
+      content: [{ type: 'text', text: line }],
+      // The same addressing tag a message carries, so a debounced or
+      // tag-keyed policy sees an ambient change as ambient; the host folds
+      // chat:mention / chat:dm into chat:addressed.
+      tags: [
+        tag,
+        ...(ev.kind === 'move' ? ['zulip:moved'] : []),
+        ...(ev.isDM ? [CHAT_TAGS.dm, CHAT_TAGS.private] : ev.mentioned ? [CHAT_TAGS.mention] : [CHAT_TAGS.ambient]),
+      ],
+      metadata: {
+        change: ev.kind,
+        targetMessageId: ev.messageId,
+        targetMessageIds: ev.messageIds,
+        ...(ev.actorId !== null ? { actorId: ev.actorId } : {}),
+        ...(ev.authorEmail !== null ? { senderEmail: ev.authorEmail } : {}),
+        topic: ev.topic,
+        ...(ev.previousTopic !== null ? { previousTopic: ev.previousTopic } : {}),
+        ...(ev.movedToChannelId !== null ? { movedToChannelId: ev.movedToChannelId } : {}),
+        ...(ev.previousContent !== null ? { previousContent: ev.previousContent } : {}),
+        mentioned: ev.mentioned,
+        ...(ev.previouslyMentioned !== null ? { previouslyMentioned: ev.previouslyMentioned } : {}),
+        ...(ev.vanished ? { vanished: true } : {}),
+        isDM: ev.isDM,
+        onOwnMessage: ev.onOwnMessage,
+        // The line already names who, where and when.
+        attributed: true,
+        attributionHeader: `[${ev.kind === 'delete' ? 'deleted' : ev.kind === 'move' ? 'moved' : 'edited'}] ${head}`,
+      },
+    };
+    if (open) {
+      this.channelManager.onIncomingMessage(ev.channelId, message);
+    } else {
+      await this.pushEvent(message, `zulip_${ev.kind}_${ev.messageId}_${stamp}`, {
+        change: ev.kind,
+        targetMessageId: ev.messageId,
+      });
+    }
+  }
+
   /** Apply reaction suppression to replayed history (channels/open, gap recovery). */
   private projectHistoryReactions(messages: IncomingChannelMessage[]): IncomingChannelMessage[] {
     if (!this.filters) return messages;
@@ -1658,7 +1771,7 @@ function numericId(m: IncomingChannelMessage): number | null {
 /** The human sender of a real message; null for synthetic ones (system markers, reactions, catch-up blocks). */
 function senderOf(m: IncomingChannelMessage): { id: number; email: string } | null {
   const meta = (typeof m.metadata === 'object' && m.metadata !== null ? m.metadata : {}) as Record<string, unknown>;
-  if (meta.system === true || meta.reaction === true || meta.missed === true) return null;
+  if (meta.system === true || meta.reaction === true || meta.missed === true || typeof meta.change === 'string') return null;
   const id = Number(m.author?.id);
   if (!Number.isFinite(id)) return null;
   return { id, email: typeof meta.senderEmail === 'string' ? meta.senderEmail : '' };
