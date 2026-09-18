@@ -33,7 +33,7 @@ import type {
   RoutingHints,
 } from './adapter.js';
 import { ZulipEventLoop, type ZulipMessageChange } from './zulip-events.js';
-import { chunkMessage, cleanContent } from '../content.js';
+import { chunkMessage, cleanMarkdown } from '../content.js';
 import { messageLineHead } from '../message-line.js';
 import { agentLineTimeFormatter } from '../timezone.js';
 import { uploadBlocks, withAttachmentLinks, type UploadPolicy, type Uploader } from '../uploads.js';
@@ -364,8 +364,8 @@ export class ZulipAdapter implements PlatformAdapter {
       const fromChannelId = fromStream !== null ? zulipChannelId(fromStream) : where.channelId;
       const placed: SeenMessage = { ...where, channelId: fromChannelId };
       if (!this.changeAllowed(placed)) return;
-      const content = change.content !== null ? cleanContent(change.content) : null;
-      const previousContent = change.origContent !== null ? cleanContent(change.origContent) : null;
+      const content = change.content !== null ? cleanMarkdown(change.content) : null;
+      const previousContent = change.origContent !== null ? cleanMarkdown(change.origContent) : null;
       const topic = change.topic ?? where.topic;
       const movedToStream = crossStream ? await this.streamNameById(Number(change.newStreamId)) : null;
       const movedToChannelId = movedToStream !== null ? zulipChannelId(movedToStream) : null;

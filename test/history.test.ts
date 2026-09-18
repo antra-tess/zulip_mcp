@@ -42,6 +42,16 @@ function raw(over: Partial<ZulipRawMessage> = {}): ZulipRawMessage {
   };
 }
 
+test('normalizeMessage keeps XML/HTML in raw markdown intact (#24)', () => {
+  const content = '```\n<tag_mapping>\n  <tag id="6001" len="127"/>\n</tag_mapping>\n```\nAT&amp;T and Map<string, T> when a < b > c';
+  const m = normalizeMessage(raw({ content }));
+  assert.equal(m.cleanContent, content);
+  const text = toIncoming('zulip:general', m, { selfUserId: 790, sessionId: 's' }).content[0];
+  assert.equal(text.type, 'text');
+  assert.ok(text.text.includes('<tag id="6001" len="127"/>'), 'wake/history text carries the tags verbatim');
+  assert.ok(text.text.includes('AT&amp;T'), 'entities are not unescaped on the raw path');
+});
+
 test('normalizeMessage reads the fields the rest of the server relies on', () => {
   const m = normalizeMessage(raw());
   assert.equal(m.id, 42);

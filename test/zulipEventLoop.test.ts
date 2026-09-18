@@ -377,6 +377,7 @@ test('reaction events are forwarded to the reaction handler and never to onMessa
     reactions.push({ op: ev.op, emoji_name: ev.emoji_name, message_id: ev.message_id, name: ev.user?.full_name });
   });
   assert.deepEqual(registered[0].event_types, ['message', 'reaction', 'update_message', 'delete_message'], 'the queue asks for reactions, edits and deletions');
+  assert.equal(registered[0].apply_markdown, 'false', 'the queue asks for raw markdown; cleanMarkdown depends on it (#24)');
   assert.equal(typeof registered[0].client_capabilities, 'string', 'zulip-js encodes only arrays: an object would go over the wire as [object Object]');
   assert.deepEqual(JSON.parse(registered[0].client_capabilities as string), { bulk_message_deletion: true }, 'a topic deletion arrives as one event, not N');
   assert.deepEqual(messages, []);

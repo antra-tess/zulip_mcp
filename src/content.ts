@@ -211,10 +211,13 @@ export function extractZulipAttachments(rawContent: string): AttachmentRef[] {
 }
 
 // Helper function to strip HTML and format content with mention handling.
-// Used on paths where Zulip returns rendered HTML (get_channel_history,
-// context/beforeInference message history). The push-event path receives raw
-// markdown (apply_markdown:false) where /user_uploads/ paths are already
-// textual, so attachment refs there are extracted by extractZulipAttachments.
+// Only for paths where Zulip returns rendered HTML: today that is
+// `formatMessages` in tool-runtime.ts, fed by `messages.retrieve` without
+// `apply_markdown:false`. Everything that goes through `normalizeMessage`
+// (history, fetch_around, DM discovery, the live event queue) is raw markdown
+// and uses `cleanMarkdown` instead; running this strip on raw markdown deletes
+// author-typed XML/HTML (#24). Attachment refs on the raw path are extracted
+// by extractZulipAttachments.
 export function cleanContent(html: string): string {
   let content = html;
 
@@ -269,6 +272,19 @@ export function cleanContent(html: string): string {
     .trim();
 
   return content;
+}
+
+/**
+ * Normalise raw markdown as returned by Zulip with `apply_markdown: false`.
+ * Deliberately NOT an HTML stripper: raw markdown contains no HTML of Zulip's
+ * making, so any `<...>` in it is the author's own text (XML in a fenced
+ * block, generics such as `Map<string, T>`, comparisons). Running
+ * `cleanContent()` on this path deleted all of it (#24). Mentions are already
+ * textual (`@**Name**`) and uploads are `[name](/user_uploads/...)`, so the
+ * only work left is line-ending and whitespace normalisation.
+ */
+export function cleanMarkdown(raw: string): string {
+  return raw.replace(/\r\n?/g, '\n').trim();
 }
 
 /** Zulip's default `max_message_length` realm setting. */
