@@ -22,7 +22,7 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { ZulipEventLoop } from '../src/platforms/zulip-events.ts';
+import { ZulipEventLoop, type ZulipMessageChange } from '../src/platforms/zulip-events.ts';
 import type { PlatformSystemEvent } from '../src/platforms/adapter.ts';
 
 /**
@@ -376,10 +376,91 @@ test('reaction events are forwarded to the reaction handler and never to onMessa
   await loop.start(zulipClient, (_s, m) => { messages.push(m); }, undefined, (ev) => {
     reactions.push({ op: ev.op, emoji_name: ev.emoji_name, message_id: ev.message_id, name: ev.user?.full_name });
   });
-  assert.deepEqual(registered[0].event_types, ['message', 'reaction'], 'the queue asks for reactions');
+  assert.deepEqual(registered[0].event_types, ['message', 'reaction', 'update_message', 'delete_message'], 'the queue asks for reactions, edits and deletions');
+  assert.equal(typeof registered[0].client_capabilities, 'string', 'zulip-js encodes only arrays: an object would go over the wire as [object Object]');
+  assert.deepEqual(JSON.parse(registered[0].client_capabilities as string), { bulk_message_deletion: true }, 'a topic deletion arrives as one event, not N');
   assert.deepEqual(messages, []);
   assert.deepEqual(reactions, [
     { op: 'add', emoji_name: 'thumbs_up', message_id: 77, name: 'Ann' },
     { op: 'remove', emoji_name: 'eyes', message_id: 78, name: undefined },
   ]);
+});
+
+test('edits, topic moves and deletions reach onChange; re-renders and unchanged updates do not (#22)', async () => {
+  let loop: ZulipEventLoop;
+  const { sleep } = makeSleepRecorder(() => loop, 1);
+  loop = new ZulipEventLoop({ sleep });
+  let polls = 0;
+  const zulipClient = {
+    queues: { register: async () => ({ queue_id: 'q1', last_event_id: -1 }) },
+    events: {
+      retrieve: async () => {
+        polls++;
+        if (polls > 1) { loop.stop(); return { events: [] }; }
+        return {
+          events: [
+            // A content edit by the author, mentioning the bot as it now reads.
+            { id: 1, type: 'update_message', message_id: 77, message_ids: [77], user_id: 9, edit_timestamp: 1_710_000_100, rendering_only: false, orig_content: 'old', content: 'new @**bot**', flags: ['mentioned'], stream_id: 7 },
+            // A link preview arriving: nothing the author wrote changed.
+            { id: 2, type: 'update_message', message_id: 78, message_ids: [78], user_id: null, edit_timestamp: 1_710_000_101, rendering_only: true, content: 'with preview', stream_id: 7 },
+            // A topic move of three messages, by a moderator.
+            { id: 3, type: 'update_message', message_id: 79, message_ids: [79, 80, 81], user_id: 12, edit_timestamp: 1_710_000_102, orig_subject: 'old topic', subject: 'new topic', propagate_mode: 'change_all', stream_id: 7 },
+            // A move to another stream under the same topic name: Zulip sends
+            // orig_subject for every move but subject only for a rename.
+            { id: 4, type: 'update_message', message_id: 82, message_ids: [82], user_id: 12, edit_timestamp: 1_710_000_103, stream_id: 7, new_stream_id: 8, orig_subject: 'same' },
+            // An update that names no change at all.
+            { id: 5, type: 'update_message', message_id: 83, message_ids: [83], user_id: 9, edit_timestamp: 1_710_000_104, stream_id: 7 },
+            { id: 6, type: 'delete_message', message_ids: [84, 85], message_type: 'stream', stream_id: 7, topic: 'deploys' },
+            { id: 7, type: 'delete_message', message_id: 86, message_type: 'private' },
+            { id: 8, type: 'heartbeat' },
+          ],
+        };
+      },
+    },
+  };
+  const messages: unknown[] = [];
+  const changes: ZulipMessageChange[] = [];
+  await loop.start(zulipClient, (_s, m) => { messages.push(m); }, undefined, undefined, (c) => { changes.push(c); });
+  assert.deepEqual(messages, [], 'changes never reach onMessage');
+  assert.deepEqual(changes, [
+    { kind: 'edit', messageId: 77, messageIds: [77], actorId: 9, editedAt: 1_710_000_100, content: 'new @**bot**', origContent: 'old', topic: null, origTopic: null, streamId: 7, newStreamId: null, flags: ['mentioned'] },
+    { kind: 'edit', messageId: 79, messageIds: [79, 80, 81], actorId: 12, editedAt: 1_710_000_102, content: null, origContent: null, topic: 'new topic', origTopic: 'old topic', streamId: 7, newStreamId: null, flags: [] },
+    { kind: 'edit', messageId: 82, messageIds: [82], actorId: 12, editedAt: 1_710_000_103, content: null, origContent: null, topic: null, origTopic: 'same', streamId: 7, newStreamId: 8, flags: [] },
+    { kind: 'delete', messageIds: [84, 85], messageType: 'stream', streamId: 7, topic: 'deploys' },
+    { kind: 'delete', messageIds: [86], messageType: 'private', streamId: null, topic: null },
+  ]);
+});
+
+test('a throwing onChange handler does not abort the batch', async () => {
+  let loop: ZulipEventLoop;
+  const { sleep } = makeSleepRecorder(() => loop, 1);
+  loop = new ZulipEventLoop({ sleep });
+  let polls = 0;
+  const zulipClient = {
+    queues: { register: async () => ({ queue_id: 'q1', last_event_id: -1 }) },
+    events: {
+      retrieve: async () => {
+        polls++;
+        if (polls > 1) { loop.stop(); return { events: [] }; }
+        return {
+          events: [
+            { id: 1, type: 'update_message', message_id: 1, user_id: 9, edit_timestamp: 1, orig_content: 'a', content: 'b' },
+            { id: 2, type: 'delete_message', message_id: 2, message_type: 'stream', stream_id: 7 },
+          ],
+        };
+      },
+    },
+  };
+  const seen: string[] = [];
+  const original = console.error;
+  console.error = () => {};
+  try {
+    await loop.start(zulipClient, () => {}, undefined, undefined, (c) => {
+      if (c.kind === 'edit') throw new Error('handler blew up');
+      seen.push(c.kind);
+    });
+  } finally {
+    console.error = original;
+  }
+  assert.deepEqual(seen, ['delete']);
 });

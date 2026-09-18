@@ -280,11 +280,14 @@ export class ChannelManager {
   onIncomingMessage(channelId: string, message: IncomingChannelMessage): void {
     if (!this.openChannels.has(channelId)) return; // channel not opened by host
 
-    // Remember where the conversation is, so publishes reply in-thread.
-    this.lastIncoming.set(channelId, {
-      threadId: message.threadId,
-      metadata: isRecord(message.metadata) ? message.metadata : undefined,
-    });
+    // Remember where the conversation is, so publishes reply in-thread. A
+    // marker about a message (a reaction, an edit, a move, a deletion) is not
+    // the conversation: a moderator moving a month-old message to `archive`
+    // must not retarget the reply the agent is composing in `support`.
+    const meta = isRecord(message.metadata) ? message.metadata : undefined;
+    if (!(meta?.reaction === true || typeof meta?.change === 'string')) {
+      this.lastIncoming.set(channelId, { threadId: message.threadId, metadata: meta });
+    }
 
     this.enqueue(channelId, message);
   }
