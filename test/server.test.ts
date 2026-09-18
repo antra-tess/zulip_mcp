@@ -1926,3 +1926,26 @@ test('an edit, move or deletion is as visible as its message: open channels see 
   assert.equal((h.pushed[3].origin as { change: string }).change, 'delete');
   await h.close();
 });
+
+test('an edit from a stream the bot joined after startup registers the channel too (#20)', async () => {
+  // The first thing a newly joined stream sends can be an edit — a message
+  // edited into a mention. That marker must not name a channel the agent
+  // cannot then open.
+  const h = harness();
+  await initialize(h, true);
+  await settled(h);
+  h.adapter.visible = [DESCRIPTOR, LATE_STREAM];
+
+  h.adapter.change!({
+    kind: 'edit', channelId: 'zulip:ops', messageId: '900', messageIds: ['900'], authorId: '9', authorName: 'Ann',
+    authorEmail: 'ann@example.com', actorId: '9', topic: 'incidents', previousTopic: null, movedToChannelId: null,
+    content: '@bot look at this', previousContent: 'look at this', mentioned: true, previouslyMentioned: false,
+    vanished: false, isDM: false, onOwnMessage: false, timestamp: new Date(1_700_000_060_000),
+  });
+
+  await until(() => h.pushed.length === 1, 'the edit is pushed');
+  assert.ok(h.hostSaw.some((r) => r.method === method.CHANNELS_CHANGED && JSON.stringify(r.params).includes('zulip:ops')), 'and the channel was announced');
+  const opened = (await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:ops', type: 'zulip', address: {} })) as { channel: ChannelDescriptor };
+  assert.equal(opened.channel.id, 'zulip:ops');
+  await h.close();
+});

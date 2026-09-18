@@ -27,3 +27,6 @@
   and without it the backlog would be retried on every refresh forever.
 - `listen` registers only the streams it joined (no realm enumeration) and
   reports how the host answered, instead of logging it to stderr.
+- An edit, move or deletion from a stream the bot joined after startup
+  registers that channel too, so a message edited into a mention does not
+  name a channel the agent cannot open (#22 delivers those markers).

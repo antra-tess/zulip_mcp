@@ -1362,6 +1362,22 @@ export class ZulipMcplServer {
   }
 
   /**
+   * Make sure a channel this server is about to deliver from is registered.
+   * Runs off the request loop (the event path), so the announcement cannot
+   * deadlock against a host that reconciles before it answers.
+   */
+  private async ensureChannelKnown(channelId: string): Promise<void> {
+    if (this.channelManager.getChannel(channelId)) return;
+    if (!this.conn || !this.mcplActive || !this.adapter.describeChannels) return;
+    try {
+      const [descriptor] = await this.adapter.describeChannels([channelId]);
+      if (descriptor) await this.channelManager.registerAdditional([descriptor]);
+    } catch (error) {
+      console.error(`[zulip-mcp] could not register ${channelId} from a message change:`, (error as Error).message);
+    }
+  }
+
+  /**
    * Register the streams `listen` just subscribed the bot to, and say how it
    * went so the tool can report it rather than hiding it in stderr.
    */
@@ -1643,6 +1659,12 @@ export class ZulipMcplServer {
     if (this.isMuted(ev.channelId) || !this.isAllowed(ev.channelId)) return;
     if (!this.mcplActive || !this.grant.isFeatureSetActive(MESSAGING_FEATURE_SET)) return;
     const addressed = ev.mentioned || ev.isDM;
+    // An edit or a deletion can be the first thing this server sees from a
+    // stream the bot was added to after startup — a message edited into a
+    // mention, say. Register the channel from it for the same reason a
+    // message registers one (#20): the agent cannot open what it was told
+    // about but this server never announced.
+    await this.ensureChannelKnown(ev.channelId);
     const open = this.channelManager.isOpen(ev.channelId);
     if (!open && !addressed) return;
     if (open && !addressed && !ev.onOwnMessage) {
