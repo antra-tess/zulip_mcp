@@ -50,7 +50,7 @@ import {
   type StateRollbackResult,
   type TextContent,
 } from '@animalabs/mcpl-core';
-import { ChannelManager, type HostClient } from './channels.js';
+import { ChannelManager, type HostClient, type RegisterAdditionalResult } from './channels.js';
 import { ContextProvider } from './context.js';
 import { DeliveryState, attributeMessage, renderMissedBlock, selectMissed, viewOf, DEFAULT_MISSED_BLOCK_MAX_CHARS } from './delivery.js';
 import { McplRpcError, capabilityDenied } from './errors.js';
@@ -71,6 +71,14 @@ import { toToolCallResult, type ToolCallResult, type ZulipToolRuntime } from './
 
 /** MCP protocol revisions this server answers with verbatim. Anything else
  *  is answered with the oldest, which every client can speak. */
+/** How long an announcement waits for the host. Short on purpose: this
+ *  server answers one request at a time, so a host that reconciles before it
+ *  answers `channels/changed` (agent-framework does) cannot be served while
+ *  this is outstanding. Timing out fast keeps the channel usable, lets the
+ *  host's own `channels/open` be answered, and leaves the re-announcement to
+ *  the next refresh. */
+const ANNOUNCE_TIMEOUT_MS = 5_000;
+
 const KNOWN_MCP_PROTOCOL_VERSIONS = new Set(['2024-11-05', '2025-03-26', '2025-06-18']);
 const FALLBACK_MCP_PROTOCOL_VERSION = '2024-11-05';
 
@@ -113,6 +121,8 @@ export interface ZulipMcplServerOptions {
   attachments?: { source: AttachmentSource; inline: InlineOptions };
   /** Size cap (characters) on one `<missed>` catch-up block; the oldest lines are elided. */
   missedBlockMaxChars?: number;
+  /** How long an announcement waits for the host (default 5s). */
+  announceTimeoutMs?: number;
   /** Render `[time id=N] [#stream > topic] Author: ` into delivered bodies (live, push, recovered replays; default true). `false` for a host that renders the structured fields itself. */
   attributeDelivery?: boolean;
 }
@@ -149,6 +159,7 @@ export class ZulipMcplServer {
   /** Distinguishes change markers minted within the same second. */
   private changeSeq = 0;
   private readonly attributeDelivery: boolean;
+  private readonly announceTimeoutMs: number;
   private readonly filters: FiltersPlane | null;
 
   constructor(
@@ -161,6 +172,7 @@ export class ZulipMcplServer {
     this.missedBlockMaxChars = Math.max(1000, options.missedBlockMaxChars ?? DEFAULT_MISSED_BLOCK_MAX_CHARS);
     this.formatTime = options.formatTime ?? agentLineTimeFormatter();
     this.attributeDelivery = options.attributeDelivery !== false;
+    this.announceTimeoutMs = options.announceTimeoutMs ?? ANNOUNCE_TIMEOUT_MS;
     this.filters = options.filters ?? null;
     this.delivery = new DeliveryState(options.stateDir ?? null, options.sessionId ?? 'default');
     // A widened stream allowlist means channels the host has never seen:
@@ -193,7 +205,7 @@ export class ZulipMcplServer {
 
     const host: HostClient = {
       registerChannels: (channels) => this.registerChannelsWithHost(channels),
-      channelsChanged: (params) => this.channelsChangedWithHost(params),
+      channelsChanged: (params, timeoutMs) => this.channelsChangedWithHost(params, timeoutMs),
       sendIncoming: (messages) => this.sendIncomingToHost(messages),
     };
     this.channelManager = new ChannelManager(host, this.adapters, this.grant, options.batchWindowMs, {
@@ -212,6 +224,11 @@ export class ZulipMcplServer {
     });
     // Sends made through the tool surface are part of the rollback record.
     this.tools.onSent = (sent) => this.stateTracker.recordSent(sent.messageId, sent.channelId, sent.content);
+    // A stream `listen` just subscribed the bot to is registered at once, so
+    // the host can open it without waiting for a message or a refresh (#20).
+    // Only those streams: a realm enumeration here would cost a full stream
+    // list plus a DM-history fetch to announce what the caller already named.
+    this.tools.onSubscribed = (streams) => this.registerSubscribed(streams);
     // A deletion made through the tool surface echoes back as a delete event
     // without an actor; the adapter recognises its own.
     this.tools.onDeleted = (messageId) => this.adapter.noteSelfDeleted?.(Number(messageId));
@@ -639,6 +656,9 @@ export class ZulipMcplServer {
   private async handleChannelOpen(params: ChannelsOpenParams): Promise<ChannelsOpenResult> {
     if (!this.grant.has('channels.lifecycle')) throw capabilityDenied('channels.lifecycle');
     const descriptor = this.channelManager.findChannel(params);
+    // Opening a channel is proof the host knows it — the only proof available
+    // when the answer to its announcement cannot reach us (#20 review).
+    this.channelManager.confirmAnnounced(descriptor.id);
     const result: ChannelsOpenResult = { channel: descriptor };
 
     // Zulip only delivers stream events to subscribers; an open channel the
@@ -697,6 +717,9 @@ export class ZulipMcplServer {
   }
 
   private handleChannelClose(params: ChannelsCloseParams): { closed: boolean } {
+    // As with open: the host named a channel, so it has it. agent-framework
+    // reconciles a channel it does not want with `channels/close`.
+    this.channelManager.confirmAnnounced(params.channelId);
     const result = this.channelManager.closeChannel(params);
     this.delivery.markClosed(params.channelId);
     this.delivery.save();
@@ -850,9 +873,10 @@ export class ZulipMcplServer {
     // which is not the same as having heard it.
     if (!this.grant.isFeatureSetActive(MESSAGING_FEATURE_SET)) return;
 
-    // A conversation the host has never seen (a DM from someone new): make
-    // it a registered channel first, so the host can open it and route a
-    // reply back to it.
+    // A channel the host has never seen — a DM from someone new, or a stream
+    // the bot was added to after startup (#20): make it a registered channel
+    // first, so the host can open it and route a reply back to it. The
+    // message that arrived is itself the proof that the channel is reachable.
     if (newChannel && !this.channelManager.getChannel(channelId)) {
       await this.channelManager.registerAdditional([newChannel]);
     }
@@ -1327,12 +1351,52 @@ export class ZulipMcplServer {
    * does not know yet — after a filters change widened the allowlist, or on
    * request (refresh_channels).
    */
-  async applyFilterChange(): Promise<{ visible: number; added: string[] }> {
-    if (!this.conn || !this.mcplActive) return { visible: 0, added: [] };
+  async applyFilterChange(opts: { retryRefused?: boolean } = {}): Promise<{ visible: number; added: string[]; local: string[]; refused: string[]; reason?: string }> {
+    if (!this.conn || !this.mcplActive) {
+      return { visible: 0, added: [], local: [], refused: [], reason: 'not connected to an MCPL host; channels are registered in MCPL mode only' };
+    }
     const descriptors = await this.adapter.discoverChannels();
-    const added = await this.channelManager.registerAdditional(descriptors);
-    if (added.length > 0) console.error(`[zulip-mcp] registered ${added.length} newly visible channel(s): ${added.join(', ')}`);
-    return { visible: descriptors.length, added };
+    const result = await this.channelManager.registerAdditional(descriptors, { retryBacklog: true, retryRefused: opts.retryRefused });
+    if (result.announced.length > 0) console.error(`[zulip-mcp] registered ${result.announced.length} newly visible channel(s): ${result.announced.join(', ')}`);
+    return { visible: descriptors.length, added: result.announced, local: result.local, refused: result.refused, reason: result.reason };
+  }
+
+  /**
+   * Make sure a channel this server is about to deliver from is registered.
+   * Runs off the request loop (the event path), so the announcement cannot
+   * deadlock against a host that reconciles before it answers.
+   */
+  private async ensureChannelKnown(channelId: string): Promise<void> {
+    if (this.channelManager.getChannel(channelId)) return;
+    if (!this.conn || !this.mcplActive || !this.adapter.describeChannels) return;
+    try {
+      const [descriptor] = await this.adapter.describeChannels([channelId]);
+      if (descriptor) await this.channelManager.registerAdditional([descriptor]);
+    } catch (error) {
+      console.error(`[zulip-mcp] could not register ${channelId} from a message change:`, (error as Error).message);
+    }
+  }
+
+  /**
+   * Register the streams `listen` just subscribed the bot to, and say how it
+   * went so the tool can report it rather than hiding it in stderr.
+   */
+  private async registerSubscribed(streams: string[]): Promise<RegisterAdditionalResult> {
+    const empty: RegisterAdditionalResult = { announced: [], local: [], refused: [] };
+    if (!this.conn || !this.mcplActive) {
+      return { ...empty, reason: 'not connected to an MCPL host; channels are registered in MCPL mode only' };
+    }
+    if (!this.adapter.describeChannels) return empty;
+    try {
+      const descriptors = await this.adapter.describeChannels(streams.map((name) => `zulip:${name}`));
+      const allowed = descriptors.filter((d) => this.isAllowed(d.id));
+      if (allowed.length === 0) return empty;
+      return await this.channelManager.registerAdditional(allowed, { retryBacklog: true });
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      console.error(`[zulip-mcp] registering ${streams.join(', ')} after listen failed:`, error);
+      return { ...empty, reason };
+    }
   }
 
   private requireFilters(): FiltersPlane {
@@ -1457,12 +1521,19 @@ export class ZulipMcplServer {
         };
       }
       case 'refresh_channels': {
-        const { visible, added } = await this.applyFilterChange();
-        return {
-          visible,
-          added,
-          note: added.length > 0 ? `Registered ${added.length} newly visible channel(s).` : 'No new channels — the host already knows about every visible channel.',
-        };
+        // Agent-initiated: a refusal the host gave earlier is worth asking
+        // about again, since whatever made the host say no may have changed.
+        const { visible, added, local, refused, reason } = await this.applyFilterChange({ retryRefused: true });
+        const notes: string[] = [];
+        if (added.length > 0) notes.push(`Registered ${added.length} newly visible channel(s).`);
+        if (local.length > 0) notes.push(`${local.length} channel(s) could not be announced to the host (${reason ?? 'no answer'}); they are usable here and will be re-announced.`);
+        if (refused.length > 0) notes.push(`The host refused ${refused.length} channel(s): ${refused.join(', ')}.`);
+        if (notes.length === 0) {
+          notes.push(reason
+            ? `No channels were announced: ${reason}.`
+            : 'No new channels — the host already knows about every visible channel this server can see. A stream outside the filters allowlist is not visible here and is not counted.');
+        }
+        return { visible, added, ...(local.length > 0 ? { pendingAnnouncement: local } : {}), ...(refused.length > 0 ? { refused } : {}), note: notes.join(' ') };
       }
       case 'channel_missed': {
         const channelId = this.channelIdArg(args.channel);
@@ -1588,6 +1659,12 @@ export class ZulipMcplServer {
     if (this.isMuted(ev.channelId) || !this.isAllowed(ev.channelId)) return;
     if (!this.mcplActive || !this.grant.isFeatureSetActive(MESSAGING_FEATURE_SET)) return;
     const addressed = ev.mentioned || ev.isDM;
+    // An edit or a deletion can be the first thing this server sees from a
+    // stream the bot was added to after startup — a message edited into a
+    // mention, say. Register the channel from it for the same reason a
+    // message registers one (#20): the agent cannot open what it was told
+    // about but this server never announced.
+    await this.ensureChannelKnown(ev.channelId);
     const open = this.channelManager.isOpen(ev.channelId);
     if (!open && !addressed) return;
     if (open && !addressed && !ev.onOwnMessage) {
@@ -1694,10 +1771,10 @@ export class ZulipMcplServer {
     return (await conn.sendRequest(method.CHANNELS_REGISTER, { channels })) as ChannelsRegisterResult | undefined;
   }
 
-  private async channelsChangedWithHost(params: ChannelsChangedParams): Promise<ChannelsRegisterResult | undefined> {
+  private async channelsChangedWithHost(params: ChannelsChangedParams, timeoutMs = this.announceTimeoutMs): Promise<ChannelsRegisterResult | undefined> {
     const conn = this.conn;
     if (!conn) throw new Error('not connected');
-    return (await conn.sendRequest(method.CHANNELS_CHANGED, params)) as ChannelsRegisterResult | undefined;
+    return (await conn.sendRequest(method.CHANNELS_CHANGED, params, timeoutMs)) as ChannelsRegisterResult | undefined;
   }
 
   private async sendIncomingToHost(messages: IncomingChannelMessage[]): Promise<ChannelsIncomingResult | undefined> {
