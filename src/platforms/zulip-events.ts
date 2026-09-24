@@ -160,7 +160,14 @@ export interface ZulipRetrieveResponse {
  */
 export interface ZulipEventClient {
   queues: {
-    register(params: Record<string, unknown>): Promise<{ queue_id: string; last_event_id: number }>;
+    register(params: Record<string, unknown>): Promise<{
+      queue_id: string;
+      last_event_id: number;
+      /** Present on a returned (not thrown) error: zulip-js hands 4xx bodies back as values. */
+      result?: string;
+      msg?: string;
+      code?: string;
+    }>;
   };
   events: {
     retrieve(params: { queue_id: string; last_event_id: number }): Promise<ZulipRetrieveResponse>;
@@ -273,13 +280,28 @@ export class ZulipEventLoop {
     // `client_capabilities` must be pre-stringified: zulip-js JSON-encodes
     // arrays only, and a raw object goes over the wire as "[object Object]".
     // Without bulk_message_deletion a topic deletion is one event per
-    // message.
+    // message. `notification_settings_null` is spelled out at its documented
+    // default (false): Zulip 12 validates client_capabilities as a whole
+    // model and rejects the registration with "client_capabilities
+    // [\"notification_settings_null\"] field is missing" when it is absent.
     const registration = await zulipClient.queues.register({
       event_types: ['message', 'reaction', 'update_message', 'delete_message'],
       all_public_streams: 'true',
       apply_markdown: 'false',
-      client_capabilities: JSON.stringify({ bulk_message_deletion: true }),
+      client_capabilities: JSON.stringify({ notification_settings_null: false, bulk_message_deletion: true }),
     });
+
+    // A refused registration comes back as a value, not a throw. Without
+    // this check the loop went on polling queue "undefined" and logged only
+    // "returned no events array" — every event lost, the cause invisible.
+    // Throwing hands it to the outer loop: logged with Zulip's reason and
+    // retried after its pause.
+    if (registration?.result === 'error' || typeof registration?.queue_id !== 'string') {
+      throw new Error(
+        `Zulip event queue registration failed: ${registration?.msg ?? 'no queue_id in the response'}` +
+          (registration?.code ? ` (${registration.code})` : ''),
+      );
+    }
 
     this.queueId = registration.queue_id;
     let lastEventId = registration.last_event_id;
