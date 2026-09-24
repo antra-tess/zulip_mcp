@@ -383,3 +383,51 @@ test('a change to the bot\'s own DM message is judged by whom it was sent to', a
   assert.equal(await run({ streamAllowed: () => true, dmAllowed: (u) => u.id === 42 || u.id === 7 }), 1, 'a counterpart is allowlisted');
   assert.equal(await run({ streamAllowed: () => true, dmAllowed: (u) => u.id === 999 }), 0, 'no counterpart is: the bot\'s own authorship is no pass');
 });
+
+test('a message from a stream created after startup carries its descriptor, once', async () => {
+  // Discovery saw only #general; #late-stream is created later and its
+  // first message (a mention of the bot) arrives live.
+  const events = [
+    { id: 1, type: 'message', flags: [], message: raw(10) },
+    { id: 2, type: 'message', flags: ['mentioned'], message: raw(11, { display_recipient: 'late-stream', stream_id: 9, content: '@**Bot** hi' }) },
+    { id: 3, type: 'message', flags: [], message: raw(12, { display_recipient: 'late-stream', stream_id: 9 }) },
+    // Outside the allowlist: filtered before any descriptor is made.
+    { id: 4, type: 'message', flags: [], message: raw(13, { display_recipient: 'secret', stream_id: 8 }) },
+  ];
+  let polls = 0;
+  const client = {
+    streams: { retrieve: async () => ({ result: 'success', streams: [{ name: 'general', stream_id: 7, subscriber_count: 2 }] }) },
+    messages: { retrieve: async () => ({ result: 'success', messages: [], found_newest: true, found_oldest: true }) },
+    queues: { register: async () => ({ queue_id: 'q1', last_event_id: -1 }) },
+    events: {
+      retrieve: async () => {
+        polls++;
+        if (polls === 1) return { events };
+        await new Promise((r) => setTimeout(r, 5));
+        return { events: [] };
+      },
+    },
+  };
+  const filters: FilterView = { streamAllowed: (s) => s !== 'secret', dmAllowed: () => true };
+  const adapter = new ZulipAdapter(client, SELF, 's', { filters, dmDiscoveryLimit: 0 });
+  await adapter.discoverChannels();
+  const seen: { id: string; channelId: string; newChannel?: string; address?: unknown }[] = [];
+  const original = console.error;
+  console.error = () => {};
+  try {
+    adapter.startEvents((m, d) => { seen.push({ id: m.messageId, channelId: m.channelId, newChannel: d?.id, address: d?.address }); });
+    const deadline = Date.now() + 2000;
+    while (seen.length < 3 && Date.now() < deadline) await new Promise((r) => setTimeout(r, 5));
+    adapter.stopEvents();
+  } finally {
+    console.error = original;
+  }
+  assert.deepEqual(seen, [
+    // Known from discovery: nothing to announce.
+    { id: '10', channelId: 'zulip:general', newChannel: undefined, address: undefined },
+    // New: described from the message, with the stream id publishing needs.
+    { id: '11', channelId: 'zulip:late-stream', newChannel: 'zulip:late-stream', address: { stream_name: 'late-stream', stream_id: 9 } },
+    // Already described: not announced again.
+    { id: '12', channelId: 'zulip:late-stream', newChannel: undefined, address: undefined },
+  ]);
+});
