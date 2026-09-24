@@ -227,9 +227,14 @@ export class ChannelManager {
     if (params.channelId) {
       const descriptor = this.allChannels.get(params.channelId);
       if (!descriptor) {
-        throw new McplRpcError(ERR_UNKNOWN_CHANNEL, `Unknown channel: ${params.channelId}`, {
-          channelId: params.channelId,
-        });
+        throw new McplRpcError(
+          ERR_UNKNOWN_CHANNEL,
+          `Unknown channel: ${params.channelId} — not visible to the bot, filtered out, or not registered ` +
+            `with the host (refresh_channels re-announces what the bot can see)`,
+          {
+            channelId: params.channelId,
+          },
+        );
       }
       return descriptor;
     }
