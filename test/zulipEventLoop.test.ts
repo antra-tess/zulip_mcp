@@ -379,7 +379,13 @@ test('reaction events are forwarded to the reaction handler and never to onMessa
   assert.deepEqual(registered[0].event_types, ['message', 'reaction', 'update_message', 'delete_message'], 'the queue asks for reactions, edits and deletions');
   assert.equal(registered[0].apply_markdown, 'false', 'the queue asks for raw markdown; cleanMarkdown depends on it (#24)');
   assert.equal(typeof registered[0].client_capabilities, 'string', 'zulip-js encodes only arrays: an object would go over the wire as [object Object]');
-  assert.deepEqual(JSON.parse(registered[0].client_capabilities as string), { bulk_message_deletion: true }, 'a topic deletion arrives as one event, not N');
+  // bulk_message_deletion: a topic deletion arrives as one event, not N.
+  // notification_settings_null at its default: Zulip 12 refuses the
+  // registration when it is missing.
+  assert.deepEqual(
+    JSON.parse(registered[0].client_capabilities as string),
+    { notification_settings_null: false, bulk_message_deletion: true },
+  );
   assert.deepEqual(messages, []);
   assert.deepEqual(reactions, [
     { op: 'add', emoji_name: 'thumbs_up', message_id: 77, name: 'Ann' },
@@ -464,4 +470,44 @@ test('a throwing onChange handler does not abort the batch', async () => {
     console.error = original;
   }
   assert.deepEqual(seen, ['delete']);
+});
+
+test('a refused queue registration is surfaced and retried, never polled as queue "undefined"', async () => {
+  let loop: ZulipEventLoop;
+  const pauses: number[] = [];
+  loop = new ZulipEventLoop({ sleep: async (ms: number) => { pauses.push(ms); } });
+  let registers = 0;
+  const polledQueues: unknown[] = [];
+  const zulipClient = {
+    queues: {
+      register: async () => {
+        registers++;
+        // What Zulip 12 answered live: an error body, returned as a value.
+        if (registers === 1) {
+          return { result: 'error', msg: 'client_capabilities["notification_settings_null"] field is missing: Field required', code: 'BAD_REQUEST' } as unknown as { queue_id: string; last_event_id: number };
+        }
+        return { queue_id: 'q2', last_event_id: -1 };
+      },
+    },
+    events: {
+      retrieve: async (p: { queue_id: string }) => {
+        polledQueues.push(p.queue_id);
+        loop.stop();
+        return { events: [] };
+      },
+    },
+  };
+  const logged: string[] = [];
+  const original = console.error;
+  console.error = (...args: unknown[]) => { logged.push(args.map(String).join(' ')); };
+  try {
+    await loop.start(zulipClient, () => {});
+  } finally {
+    console.error = original;
+  }
+  assert.equal(registers, 2, 're-registered after the refusal');
+  assert.deepEqual(polledQueues, ['q2'], 'only the real queue is polled');
+  assert.ok(logged.some((l) => /registration failed: client_capabilities\["notification_settings_null"\] field is missing.*BAD_REQUEST/.test(l)), 'Zulip\'s reason is logged');
+  assert.ok(!logged.some((l) => /no events array/.test(l)), 'not misreported as a malformed poll');
+  assert.deepEqual(pauses, [5000], 'the outer loop pauses before retrying');
 });
