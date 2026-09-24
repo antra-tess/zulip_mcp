@@ -162,6 +162,10 @@ export class ZulipAdapter implements PlatformAdapter {
   private readonly formatTime: (d: Date) => string;
   /** DM conversations already described to the server, by channel id. */
   private knownDms = new Map<string, ChannelDescriptor>();
+  /** Stream channel ids already described to the server (discovery, or a
+   *  message from a stream created after startup), so a new stream is
+   *  announced once — the stream counterpart of `knownDms`. */
+  private knownStreams = new Set<string>();
   /** Recently seen messages, so a reaction or an edit can be placed without
    *  a round trip: id → channel, author, topic, snippet. Bounded; oldest
    *  evicted. A deletion can only be placed from here — the message is gone. */
@@ -222,25 +226,12 @@ export class ZulipAdapter implements PlatformAdapter {
           this.streamNamesById.set(stream.stream_id, stream.name);
         }
         if (!this.filters.streamAllowed(stream.name)) continue;
-        const address: ZulipChannelAddress = { stream_name: stream.name, stream_id: stream.stream_id };
-        channels.push({
-          id: zulipChannelId(stream.name),
-          type: 'zulip',
-          label: `#${stream.name}`,
-          direction: 'bidirectional',
-          address,
-          metadata: {
-            subscriber_count: stream.subscriber_count,
-            is_public: !stream.invite_only,
-          },
-          capabilities: {
-            history: {
-              maxMessages: this.backscrollLimitFor(stream.name),
-              supportsBeforeMessage: true,
-              supportsSinceLastSeen: true,
-            },
-          },
+        const descriptor = this.streamDescriptor(stream.name, stream.stream_id, {
+          subscriber_count: stream.subscriber_count,
+          is_public: !stream.invite_only,
         });
+        this.knownStreams.add(descriptor.id);
+        channels.push(descriptor);
       }
     } catch (error) {
       console.error('Failed to discover Zulip streams:', error);
@@ -485,6 +476,48 @@ export class ZulipAdapter implements PlatformAdapter {
       };
     }
     if (event) emit(event);
+  }
+
+  /** The channel descriptor for a stream. */
+  private streamDescriptor(
+    streamName: string,
+    streamId: number,
+    metadata: Record<string, unknown> = {},
+  ): ChannelDescriptor {
+    const address: ZulipChannelAddress = { stream_name: streamName, stream_id: streamId };
+    return {
+      id: zulipChannelId(streamName),
+      type: 'zulip',
+      label: `#${streamName}`,
+      direction: 'bidirectional',
+      address,
+      metadata,
+      capabilities: {
+        history: {
+          maxMessages: this.backscrollLimitFor(streamName),
+          supportsBeforeMessage: true,
+          supportsSinceLastSeen: true,
+        },
+      },
+    };
+  }
+
+  /**
+   * The descriptor for a message's stream when discovery never described it
+   * (a stream created, or made visible, after startup), else undefined. The
+   * message carries the stream's name and id, which is all the descriptor
+   * needs; `subscriber_count` / `is_public` are left to the next discovery.
+   * Without this the stream stays unknown to the server until a restart or
+   * `refresh_channels`, so `channels/open` fails with "Unknown channel" —
+   * even for the channel invitation a mention there produces.
+   */
+  private describeNewStream(m: ZulipMessage, streamId: unknown): ChannelDescriptor | undefined {
+    if (m.streamName === null || typeof streamId !== 'number') return undefined;
+    const id = zulipChannelId(m.streamName);
+    if (this.knownStreams.has(id)) return undefined;
+    this.knownStreams.add(id);
+    this.streamNamesById.set(streamId, m.streamName);
+    return this.streamDescriptor(m.streamName, streamId);
   }
 
   /** The descriptor for a DM's conversation, remembered once described. */
@@ -831,7 +864,10 @@ export class ZulipAdapter implements PlatformAdapter {
         return;
       }
       if (m.streamName !== null && !this.filters.streamAllowed(m.streamName)) return;
-      onMessage(toIncoming(channelIdOf(m, this.identity.selfUserId), m, this.identity));
+      onMessage(
+        toIncoming(channelIdOf(m, this.identity.selfUserId), m, this.identity),
+        this.describeNewStream(m, (msg as ZulipRawMessage).stream_id),
+      );
     }, onSystemEvent, reactionHandler, changeHandler).catch(error => {
       console.error('Zulip event loop failed:', error);
     });

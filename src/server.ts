@@ -26,6 +26,7 @@
 
 import {
   ERR_CHANNEL_OPEN_FAILED,
+  ERR_UNKNOWN_CHANNEL,
   ManifestTracker,
   McplConnection,
   method,
@@ -638,7 +639,7 @@ export class ZulipMcplServer {
 
   private async handleChannelOpen(params: ChannelsOpenParams): Promise<ChannelsOpenResult> {
     if (!this.grant.has('channels.lifecycle')) throw capabilityDenied('channels.lifecycle');
-    const descriptor = this.channelManager.findChannel(params);
+    const descriptor = await this.findChannelRediscovering(params);
     const result: ChannelsOpenResult = { channel: descriptor };
 
     // Zulip only delivers stream events to subscribers; an open channel the
@@ -689,6 +690,26 @@ export class ZulipMcplServer {
     this.delivery.markOpen(descriptor.id);
     this.delivery.save();
     return result;
+  }
+
+  /**
+   * `findChannel`, but an unknown exact `channelId` gets one re-discovery
+   * before the open fails: a stream created (or made visible) after startup
+   * is not in the registry until something announces it, and the agent
+   * asking to open it is exactly that something. Only a miss re-discovers,
+   * so opening a known channel costs no extra round trip.
+   */
+  private async findChannelRediscovering(params: ChannelsOpenParams): Promise<ChannelDescriptor> {
+    try {
+      return this.channelManager.findChannel(params);
+    } catch (err) {
+      if (!params.channelId || !(err instanceof McplRpcError) || err.code !== ERR_UNKNOWN_CHANNEL) throw err;
+      const { added } = await this.applyFilterChange();
+      if (added.length > 0) {
+        console.error(`[zulip-mcp] channels/open ${params.channelId}: re-discovery registered ${added.join(', ')}`);
+      }
+      return this.channelManager.findChannel(params);
+    }
   }
 
   /** The delivered form of a message: attributed unless the host asked for bare bodies. */

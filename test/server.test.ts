@@ -1201,6 +1201,51 @@ test('channels/open fails — and commits nothing — when the bot cannot subscr
   await h.close();
 });
 
+test('channels/open re-discovers once when the channel was created after startup', async () => {
+  const h = harness();
+  await initialize(h, true);
+  await settled(h);
+  const later: ChannelDescriptor = { ...DESCRIPTOR, id: 'zulip:info-exchange', label: '#info-exchange', address: { stream_name: 'info-exchange', stream_id: 9 } };
+  h.adapter.discoverChannels = async () => [DESCRIPTOR, later];
+
+  const opened = (await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:info-exchange', type: 'zulip', address: {} })) as { channel: ChannelDescriptor };
+  assert.equal(opened.channel.id, 'zulip:info-exchange');
+  assert.ok(
+    h.hostSaw.some((r) => r.method === method.CHANNELS_CHANGED && JSON.stringify(r.params).includes('zulip:info-exchange')),
+    'announced to the host before the open answered',
+  );
+  assert.deepEqual(h.adapter.subscribed, ['zulip:info-exchange']);
+  assert.equal(h.server.channelManager.isOpen('zulip:info-exchange'), true);
+
+  // A channel that still is not there fails as before, and says what to do.
+  await assert.rejects(
+    h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:nope', type: 'zulip', address: {} }),
+    (err: Error & { code?: number }) => {
+      assert.equal(err.code, -32023, 'ERR_UNKNOWN_CHANNEL');
+      assert.match(err.message, /Unknown channel: zulip:nope/);
+      assert.match(err.message, /refresh_channels/);
+      return true;
+    },
+  );
+  await h.close();
+});
+
+test('a mention in a stream created after startup registers it, so the invitation can be accepted', async () => {
+  const h = harness();
+  await initialize(h, true);
+  await settled(h);
+  const fresh: ChannelDescriptor = { ...DESCRIPTOR, id: 'zulip:info-exchange', label: '#info-exchange', address: { stream_name: 'info-exchange', stream_id: 9 } };
+  // Discovery would not find it (the stub still lists only #general): the
+  // descriptor the adapter attaches to the message is the only source.
+  h.adapter.emit!(streamMsg(20, { channelId: 'zulip:info-exchange', mentioned: true, text: '@bot join us?' }), fresh);
+  await until(() => h.pushed.length === 1, 'the mention is pushed');
+  assert.ok(h.hostSaw.some((r) => r.method === method.CHANNELS_CHANGED), 'the new stream was announced first');
+
+  const opened = (await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:info-exchange', type: 'zulip', address: {} })) as { channel: ChannelDescriptor };
+  assert.equal(opened.channel.id, 'zulip:info-exchange');
+  await h.close();
+});
+
 test('live events received before the catch-up sweep are held, so a live delivery cannot jump the watermark over the offline gap', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'zulip-prelive-'));
   try {
