@@ -362,7 +362,12 @@ export class ChannelManager {
     if (!this.grant.has('channels.typing')) throw capabilityDenied('channels.typing');
     const adapter = this.adapterFor(channelId);
     if (!adapter?.sendTyping) return;
-    await adapter.sendTyping(channelId, this.allChannels.get(channelId), metadata, op);
+    // Like publish: a host that names no topic means the conversation's
+    // current one, the topic of the newest incoming message.
+    const last = this.lastIncoming.get(channelId);
+    const routed =
+      typeof metadata?.topic === 'string' || !last?.threadId ? metadata : { ...metadata, topic: last.threadId };
+    await adapter.sendTyping(channelId, this.allChannels.get(channelId), routed, op);
   }
 
   /**

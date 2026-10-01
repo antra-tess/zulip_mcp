@@ -107,6 +107,57 @@ test('publish forwards last-incoming thread hints to the adapter', async () => {
   manager.destroy();
 });
 
+function makeTypingManager() {
+  const desc: ChannelDescriptor = {
+    id: 'zulip:support', type: 'zulip', label: '#support', direction: 'bidirectional', address: { stream_id: 7 },
+  };
+  const { adapter } = fakeAdapter('zulip', [desc]);
+  const typed: { channelId: string; metadata?: Record<string, unknown>; op: string }[] = [];
+  adapter.sendTyping = async (channelId, _d, metadata, op) => { typed.push({ channelId, metadata, op }); };
+  const grant = grantedChannels();
+  grant.apply({ effectiveCapabilities: ['channels.register', 'channels.lifecycle', 'channels.publish', 'channels.incoming', 'channels.typing'] });
+  const manager = new ChannelManager(fakeMcplClient, new Map([['zulip', adapter]]), grant, 10);
+  return { manager, typed };
+}
+
+const supportMessage = (topic: string) => ({
+  channelId: 'zulip:support',
+  messageId: '42',
+  threadId: topic,
+  author: { id: '1', name: 'alice' },
+  timestamp: new Date(0).toISOString(),
+  content: [{ type: 'text' as const, text: 'question' }],
+});
+
+test('typing without a topic from the host goes to the topic of the newest incoming message', async () => {
+  const { manager, typed } = makeTypingManager();
+  await manager.registerChannels();
+  manager.openChannel({ type: 'zulip' });
+  manager.onIncomingMessage('zulip:support', supportMessage('router A'));
+  await manager.sendTyping('zulip:support');
+  await manager.sendTyping('zulip:support', undefined, 'stop');
+  assert.deepEqual(typed.map((t) => [t.metadata?.topic, t.op]), [['router A', 'start'], ['router A', 'stop']]);
+  manager.destroy();
+});
+
+test('a topic the host names wins over the newest incoming one', async () => {
+  const { manager, typed } = makeTypingManager();
+  await manager.registerChannels();
+  manager.openChannel({ type: 'zulip' });
+  manager.onIncomingMessage('zulip:support', supportMessage('router A'));
+  await manager.sendTyping('zulip:support', { topic: 'billing' });
+  assert.equal(typed[0].metadata?.topic, 'billing');
+  manager.destroy();
+});
+
+test('typing before any incoming message passes the host metadata through unchanged', async () => {
+  const { manager, typed } = makeTypingManager();
+  await manager.registerChannels();
+  await manager.sendTyping('zulip:support');
+  assert.equal(typed[0].metadata, undefined);
+  manager.destroy();
+});
+
 test('publish has no hints before any incoming message', async () => {
   const { manager, calls } = makeManager();
   await manager.registerChannels();
