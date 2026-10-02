@@ -31,6 +31,8 @@ import type { ChannelHistoryPage, ChannelHistoryQuery, MessageChangeEvent, OnInc
 import { ZulipMcplServer, type ZulipMcplServerOptions } from '../src/server.ts';
 import { FiltersPlane } from '../src/filters.ts';
 import type { ZulipToolRuntime } from '../src/tool-runtime.ts';
+import { toolDefinitions } from '../src/tools.ts';
+import { TOOL_CLASSES } from '../src/tool-classes.ts';
 
 const DESCRIPTOR: ChannelDescriptor = {
   id: 'zulip:general',
@@ -330,6 +332,24 @@ test('a plain-MCP client gets tools and resources, and no MCPL manifest', async 
   // Events are never started for a plain-MCP client.
   assert.equal(h.adapter.emit, null);
   await h.close();
+});
+
+test('tools/list carries each tool\'s RFC-008 class and leaves the model-facing definition alone', async () => {
+  for (const mcpl of [false, true]) {
+    const h = harness({ mcpl });
+    await initialize(h, mcpl);
+    const { tools } = (await h.host.sendRequest('tools/list')) as {
+      tools: { name: string; _meta?: Record<string, unknown> }[];
+    };
+    assert.deepEqual(tools.map((t) => t.name), toolDefinitions.map((t) => t.name));
+    for (const tool of tools) {
+      assert.deepEqual(tool._meta?.['mcpl/class'], TOOL_CLASSES[tool.name], tool.name);
+      const { _meta, ...rest } = tool;
+      assert.deepEqual(rest, toolDefinitions.find((t) => t.name === tool.name), tool.name);
+    }
+    assert.deepEqual(tools.find((t) => t.name === 'send_message')?._meta, { 'mcpl/class': ['comms', 'files'] });
+    await h.close();
+  }
 });
 
 test('an unknown MCP protocol revision is answered with the fallback', async () => {
