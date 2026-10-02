@@ -6,6 +6,8 @@ export interface ToolDefinition {
   name: string;
   description: string;
   inputSchema: Record<string, unknown>;
+  /** MCP `_meta`. `tools/list` adds `mcpl/class` from src/tool-classes.ts. */
+  _meta?: Record<string, unknown>;
 }
 
 export const toolDefinitions: ToolDefinition[] = [

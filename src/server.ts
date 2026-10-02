@@ -68,6 +68,7 @@ import { messageLineHead } from './message-line.js';
 import { CHAT_TAGS } from '@animalabs/mcpl-core';
 import type { ReactionSummary } from './history.js';
 import { toolDefinitions } from './tools.js';
+import { withToolClasses } from './tool-classes.js';
 import { toToolCallResult, type ToolCallResult, type ZulipToolRuntime } from './tool-runtime.js';
 
 /** MCP protocol revisions this server answers with verbatim. Anything else
@@ -451,7 +452,8 @@ export class ZulipMcplServer {
           break;
 
         case 'tools/list':
-          conn.sendResponse(req.id, { tools: toolDefinitions });
+          // MCPL RFC-008: each tool carries its class in _meta['mcpl/class'].
+          conn.sendResponse(req.id, { tools: withToolClasses(toolDefinitions) });
           break;
 
         case 'tools/call': {
