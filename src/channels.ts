@@ -366,18 +366,24 @@ export class ChannelManager {
     const adapter = this.adapterFor(channelId);
     if (!adapter?.sendTyping) return;
     const descriptor = this.allChannels.get(channelId);
-    if (typeof metadata?.topic === 'string') return adapter.sendTyping(channelId, descriptor, metadata, op);
-    // Like publish: a host that names no topic means the conversation's
-    // current one, the topic of the newest incoming message. The host sends
-    // every refresh and the stop with the channel alone, so a run that a newer
-    // message moved must be stopped where it started, or it lingers there.
+    // A topic the host names wins. Like publish, a host that names none means
+    // the conversation's current one, the topic of the newest incoming message.
+    // The host may send refreshes and the stop with the channel alone, so a run
+    // that a newer message moved must be stopped where it started, or it
+    // lingers there.
+    const hostTopic = metadata?.topic;
+    const named = typeof hostTopic === 'string';
     const at = (topic: string | undefined) => (topic === undefined ? metadata : { ...metadata, topic });
-    const current = this.lastIncoming.get(channelId)?.threadId;
+    const current = named ? hostTopic : this.lastIncoming.get(channelId)?.threadId;
     const running = this.typingTopic.has(channelId);
     const started = this.typingTopic.get(channelId);
     if (op === 'stop') {
       this.typingTopic.delete(channelId);
-      return adapter.sendTyping(channelId, descriptor, at(running ? started : current), 'stop');
+      // A channel-only stop cancels the run where it is; a named stop cancels
+      // that topic too.
+      if (running && (!named || started !== current)) await adapter.sendTyping(channelId, descriptor, at(started), 'stop');
+      if (named || !running) await adapter.sendTyping(channelId, descriptor, at(current), 'stop');
+      return;
     }
     if (running && started !== current) await adapter.sendTyping(channelId, descriptor, at(started), 'stop');
     this.typingTopic.set(channelId, current);

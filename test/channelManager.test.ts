@@ -236,6 +236,22 @@ test('a topic the host names wins over the newest incoming one', async () => {
   manager.destroy();
 });
 
+test('a run started in a topic the host named is stopped there by a channel-only stop', async () => {
+  const { manager, typed } = makeTypingManager();
+  await manager.registerChannels();
+  manager.openChannel({ type: 'zulip' });
+  manager.onIncomingMessage('zulip:support', supportMessage('router A'));
+  await manager.sendTyping('zulip:support', { topic: 'billing' });
+  await manager.sendTyping('zulip:support', undefined, 'stop');
+  await manager.sendTyping('zulip:support');
+  await manager.sendTyping('zulip:support', { topic: 'billing' }, 'stop');
+  assert.deepEqual(typedOps(typed), [
+    ['billing', 'start'], ['billing', 'stop'],
+    ['router A', 'start'], ['router A', 'stop'], ['billing', 'stop'],
+  ]);
+  manager.destroy();
+});
+
 test('typing before any incoming message passes the host metadata through unchanged', async () => {
   const { manager, typed } = makeTypingManager();
   await manager.registerChannels();
