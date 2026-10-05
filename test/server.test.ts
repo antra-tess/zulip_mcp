@@ -31,6 +31,8 @@ import type { ChannelHistoryPage, ChannelHistoryQuery, MessageChangeEvent, OnInc
 import { ZulipMcplServer, type ZulipMcplServerOptions } from '../src/server.ts';
 import { FiltersPlane } from '../src/filters.ts';
 import type { ZulipToolRuntime } from '../src/tool-runtime.ts';
+import { toolDefinitions } from '../src/tools.ts';
+import { TOOL_CLASSES } from '../src/tool-classes.ts';
 
 const DESCRIPTOR: ChannelDescriptor = {
   id: 'zulip:general',
@@ -372,6 +374,24 @@ test('a plain-MCP client gets tools and resources, and no MCPL manifest', async 
   // Events are never started for a plain-MCP client.
   assert.equal(h.adapter.emit, null);
   await h.close();
+});
+
+test('tools/list carries each tool\'s RFC-008 class and leaves the model-facing definition alone', async () => {
+  for (const mcpl of [false, true]) {
+    const h = harness({ mcpl });
+    await initialize(h, mcpl);
+    const { tools } = (await h.host.sendRequest('tools/list')) as {
+      tools: { name: string; _meta?: Record<string, unknown> }[];
+    };
+    assert.deepEqual(tools.map((t) => t.name), toolDefinitions.map((t) => t.name));
+    for (const tool of tools) {
+      assert.deepEqual(tool._meta?.['mcpl/class'], TOOL_CLASSES[tool.name], tool.name);
+      const { _meta, ...rest } = tool;
+      assert.deepEqual(rest, toolDefinitions.find((t) => t.name === tool.name), tool.name);
+    }
+    assert.deepEqual(tools.find((t) => t.name === 'send_message')?._meta, { 'mcpl/class': ['comms', 'files'] });
+    await h.close();
+  }
 });
 
 test('an unknown MCP protocol revision is answered with the fallback', async () => {
@@ -1243,6 +1263,51 @@ test('channels/open fails — and commits nothing — when the bot cannot subscr
   await h.close();
 });
 
+test('channels/open re-discovers once when the channel was created after startup', async () => {
+  const h = harness();
+  await initialize(h, true);
+  await settled(h);
+  const later: ChannelDescriptor = { ...DESCRIPTOR, id: 'zulip:late-stream', label: '#late-stream', address: { stream_name: 'late-stream', stream_id: 9 } };
+  h.adapter.discoverChannels = async () => [DESCRIPTOR, later];
+
+  const opened = (await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:late-stream', type: 'zulip', address: {} })) as { channel: ChannelDescriptor };
+  assert.equal(opened.channel.id, 'zulip:late-stream');
+  assert.ok(
+    h.hostSaw.some((r) => r.method === method.CHANNELS_CHANGED && JSON.stringify(r.params).includes('zulip:late-stream')),
+    'announced to the host before the open answered',
+  );
+  assert.deepEqual(h.adapter.subscribed, ['zulip:late-stream']);
+  assert.equal(h.server.channelManager.isOpen('zulip:late-stream'), true);
+
+  // A channel that still is not there fails as before, and says what to do.
+  await assert.rejects(
+    h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:nope', type: 'zulip', address: {} }),
+    (err: Error & { code?: number }) => {
+      assert.equal(err.code, -32023, 'ERR_UNKNOWN_CHANNEL');
+      assert.match(err.message, /Unknown channel: zulip:nope/);
+      assert.match(err.message, /refresh_channels/);
+      return true;
+    },
+  );
+  await h.close();
+});
+
+test('a mention in a stream created after startup registers it, so the invitation can be accepted', async () => {
+  const h = harness();
+  await initialize(h, true);
+  await settled(h);
+  const fresh: ChannelDescriptor = { ...DESCRIPTOR, id: 'zulip:late-stream', label: '#late-stream', address: { stream_name: 'late-stream', stream_id: 9 } };
+  // Discovery would not find it (the stub still lists only #general): the
+  // descriptor the adapter attaches to the message is the only source.
+  h.adapter.emit!(streamMsg(20, { channelId: 'zulip:late-stream', mentioned: true, text: '@bot join us?' }), fresh);
+  await until(() => h.pushed.length === 1, 'the mention is pushed');
+  assert.ok(h.hostSaw.some((r) => r.method === method.CHANNELS_CHANGED), 'the new stream was announced first');
+
+  const opened = (await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:late-stream', type: 'zulip', address: {} })) as { channel: ChannelDescriptor };
+  assert.equal(opened.channel.id, 'zulip:late-stream');
+  await h.close();
+});
+
 test('live events received before the catch-up sweep are held, so a live delivery cannot jump the watermark over the offline gap', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'zulip-prelive-'));
   try {
@@ -1820,6 +1885,30 @@ test('a host that reconciles before it answers does not cost the channel — the
   // out rather than after the answer came back.
   await until(() => h.policy.reconcileOpens.length > 0, "the host's own channels/open is served");
   assert.deepEqual(h.policy.reconcileOpens, [{ channelId: 'zulip:ops', ok: true, detail: 'opened' }]);
+  await h.close();
+});
+
+test('channels/open re-discovery settles against a host that reconciles before it answers (#20)', async () => {
+  // The re-discovery runs inside the open, so such a host cannot answer its
+  // announcement until the open returns. With the descriptor recorded before
+  // the announcement goes out, the open succeeds after the timeout, and the
+  // host's queued reconcile-time open then finds the channel instead of
+  // re-discovering it and starting the same cycle over.
+  const h = harness({ announceTimeoutMs: 80 });
+  await initialize(h, true);
+  await settled(h);
+  h.policy.changedAnswer = 'reconcile';
+  h.adapter.visible = [DESCRIPTOR, LATE_STREAM];
+
+  const opened = (await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:ops', type: 'zulip', address: {} })) as { channel: ChannelDescriptor };
+  assert.equal(opened.channel.id, 'zulip:ops');
+  await until(() => h.policy.reconcileOpens.length > 0, "the host's reconcile-time open is served");
+  assert.deepEqual(h.policy.reconcileOpens, [{ channelId: 'zulip:ops', ok: true, detail: 'opened' }]);
+
+  // Several timeouts' worth of quiet: announced once, not once per cycle.
+  await new Promise((r) => setTimeout(r, 300));
+  assert.equal(h.hostSaw.filter((r) => r.method === method.CHANNELS_CHANGED).length, 1);
+  assert.equal(h.server.channelManager.isOpen('zulip:ops'), true);
   await h.close();
 });
 

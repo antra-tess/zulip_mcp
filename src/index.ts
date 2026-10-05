@@ -55,7 +55,7 @@ import { LOCAL_FILES_SUPPORTED, createZulipUploader, resolveUploadPolicy } from 
 import { agentLineTimeFormatter } from './timezone.js';
 import { initializeZulipClient } from './zulip-client.js';
 
-export { fetchAttachmentBytes, extractZulipAttachments, cleanContent } from './content.js';
+export { fetchAttachmentBytes, extractZulipAttachments, cleanContent, cleanMarkdown } from './content.js';
 export { formatMessages } from './tool-runtime.js';
 
 const SERVER_INFO = { name: 'zulip-mcp-server', version: '3.0.0' };

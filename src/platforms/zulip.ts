@@ -33,7 +33,7 @@ import type {
   RoutingHints,
 } from './adapter.js';
 import { ZulipEventLoop, type ZulipMessageChange } from './zulip-events.js';
-import { chunkMessage, cleanContent } from '../content.js';
+import { chunkMessage, cleanMarkdown } from '../content.js';
 import { messageLineHead } from '../message-line.js';
 import { agentLineTimeFormatter } from '../timezone.js';
 import { uploadBlocks, withAttachmentLinks, type UploadPolicy, type Uploader } from '../uploads.js';
@@ -400,8 +400,8 @@ export class ZulipAdapter implements PlatformAdapter {
       const fromChannelId = fromStream !== null ? zulipChannelId(fromStream) : where.channelId;
       const placed: SeenMessage = { ...where, channelId: fromChannelId };
       if (!this.changeAllowed(placed)) return;
-      const content = change.content !== null ? cleanContent(change.content) : null;
-      const previousContent = change.origContent !== null ? cleanContent(change.origContent) : null;
+      const content = change.content !== null ? cleanMarkdown(change.content) : null;
+      const previousContent = change.origContent !== null ? cleanMarkdown(change.origContent) : null;
       const topic = change.topic ?? where.topic;
       const movedToStream = crossStream ? await this.streamNameById(Number(change.newStreamId)) : null;
       const movedToChannelId = movedToStream !== null ? zulipChannelId(movedToStream) : null;
@@ -875,9 +875,10 @@ export class ZulipAdapter implements PlatformAdapter {
       // never confirmed must be offered again rather than held back by
       // adapter-side memory.
       const channelId = channelIdOf(m, this.identity.selfUserId);
-      const descriptor = m.streamName !== null
-        ? this.streamDescriptor(m.streamName, typeof msg.stream_id === 'number' ? msg.stream_id : undefined)
-        : undefined;
+      const streamId = typeof msg.stream_id === 'number' ? msg.stream_id : undefined;
+      // Remembered so a later reaction or edit on this stream can be placed.
+      if (m.streamName !== null && streamId !== undefined) this.streamNamesById.set(streamId, m.streamName);
+      const descriptor = m.streamName !== null ? this.streamDescriptor(m.streamName, streamId) : undefined;
       onMessage(toIncoming(channelId, m, this.identity), descriptor);
     }, onSystemEvent, reactionHandler, changeHandler).catch(error => {
       console.error('Zulip event loop failed:', error);

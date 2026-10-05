@@ -12,7 +12,7 @@
 
 import type { ChannelDescriptor, IncomingChannelMessage, TextContent } from '@animalabs/mcpl-core';
 import { CHAT_TAGS } from '@animalabs/mcpl-core';
-import { cleanContent, extractZulipAttachments, type AttachmentRef } from './content.js';
+import { cleanMarkdown, extractZulipAttachments, type AttachmentRef } from './content.js';
 
 /** A Zulip message as `GET /messages` and the event queue both deliver it. */
 export interface ZulipRawMessage {
@@ -98,6 +98,7 @@ export interface ZulipMessage {
   timestamp: Date;
   /** Raw markdown (history is fetched with apply_markdown=false). */
   rawContent: string;
+  /** Raw markdown with line endings normalised and trimmed; not HTML-stripped (#24). */
   cleanContent: string;
   mentioned: boolean;
   wildcardMentioned: boolean;
@@ -225,7 +226,7 @@ export function normalizeMessage(raw: ZulipRawMessage): ZulipMessage {
     authorEmail: raw.sender_email,
     timestamp: new Date(raw.timestamp * 1000),
     rawContent: raw.content,
-    cleanContent: cleanContent(raw.content),
+    cleanContent: cleanMarkdown(raw.content),
     mentioned: flags.includes('mentioned'),
     wildcardMentioned: flags.includes('wildcard_mentioned'),
     attachments: extractZulipAttachments(raw.content),

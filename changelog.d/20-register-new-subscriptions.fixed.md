@@ -1,8 +1,8 @@
-- A stream the bot joins after startup is usable without a restart (#20).
-  It was registered only by the startup enumeration, so `channels/open`
-  answered `Unknown channel` for it even while its mentions were being
-  delivered and `get_channel_history` worked. Now every stream message
-  carries its descriptor (as a DM from a new conversation already did), and
+- A stream the bot joins after startup stays usable without a restart
+  (#20). Every stream message now carries its descriptor, not only the
+  first one from a stream discovery never saw: whether a channel is new is
+  decided by the server's registry, which a reconnect clears, so a channel
+  whose announcement failed or was never confirmed is offered again. And
   `listen` registers what it subscribes the bot to.
 - The announcement of a channel is no longer lost when the host does not
   answer it. That is what made the reported streams unopenable:
@@ -20,6 +20,11 @@
   `pendingAnnouncement` and `refused` instead of claiming the host already
   knows every visible channel, and retries refused channels when the agent
   asks.
+- `channels/open`'s re-discovery of an unknown channel no longer loops
+  against a host that reconciles before answering. Its announcement times
+  out, but the descriptor it recorded lets the open succeed, and the host's
+  queued reconcile-time open then finds the channel instead of starting
+  another re-discovery.
 - A reconnect clears the announcement backlog, so a channel pending for one
   host is not announced to the next. A host that opens or closes a channel
   has confirmed it and it leaves the backlog — against agent-framework that

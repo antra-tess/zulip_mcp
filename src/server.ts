@@ -26,6 +26,7 @@
 
 import {
   ERR_CHANNEL_OPEN_FAILED,
+  ERR_UNKNOWN_CHANNEL,
   ManifestTracker,
   McplConnection,
   method,
@@ -67,6 +68,7 @@ import { messageLineHead } from './message-line.js';
 import { CHAT_TAGS } from '@animalabs/mcpl-core';
 import type { ReactionSummary } from './history.js';
 import { toolDefinitions } from './tools.js';
+import { withToolClasses } from './tool-classes.js';
 import { toToolCallResult, type ToolCallResult, type ZulipToolRuntime } from './tool-runtime.js';
 
 /** MCP protocol revisions this server answers with verbatim. Anything else
@@ -467,7 +469,8 @@ export class ZulipMcplServer {
           break;
 
         case 'tools/list':
-          conn.sendResponse(req.id, { tools: toolDefinitions });
+          // MCPL RFC-008: each tool carries its class in _meta['mcpl/class'].
+          conn.sendResponse(req.id, { tools: withToolClasses(toolDefinitions) });
           break;
 
         case 'tools/call': {
@@ -655,7 +658,7 @@ export class ZulipMcplServer {
 
   private async handleChannelOpen(params: ChannelsOpenParams): Promise<ChannelsOpenResult> {
     if (!this.grant.has('channels.lifecycle')) throw capabilityDenied('channels.lifecycle');
-    const descriptor = this.channelManager.findChannel(params);
+    const descriptor = await this.findChannelRediscovering(params);
     // Opening a channel is proof the host knows it — the only proof available
     // when the answer to its announcement cannot reach us (#20 review).
     this.channelManager.confirmAnnounced(descriptor.id);
@@ -709,6 +712,26 @@ export class ZulipMcplServer {
     this.delivery.markOpen(descriptor.id);
     this.delivery.save();
     return result;
+  }
+
+  /**
+   * `findChannel`, but an unknown exact `channelId` gets one re-discovery
+   * before the open fails: a stream created (or made visible) after startup
+   * is not in the registry until something announces it, and the agent
+   * asking to open it is exactly that something. Only a miss re-discovers,
+   * so opening a known channel costs no extra round trip.
+   */
+  private async findChannelRediscovering(params: ChannelsOpenParams): Promise<ChannelDescriptor> {
+    try {
+      return this.channelManager.findChannel(params);
+    } catch (err) {
+      if (!params.channelId || !(err instanceof McplRpcError) || err.code !== ERR_UNKNOWN_CHANNEL) throw err;
+      const { added } = await this.applyFilterChange();
+      if (added.length > 0) {
+        console.error(`[zulip-mcp] channels/open ${params.channelId}: re-discovery registered ${added.join(', ')}`);
+      }
+      return this.channelManager.findChannel(params);
+    }
   }
 
   /** The delivered form of a message: attributed unless the host asked for bare bodies. */

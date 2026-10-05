@@ -8,7 +8,7 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { cleanContent, extractZulipAttachments } from '../src/index.ts';
+import { cleanContent, cleanMarkdown, extractZulipAttachments } from '../src/index.ts';
 
 test('cleanContent: attachment anchor preserves filename + URL', () => {
   const html = '<p><a href="/user_uploads/2/foo.csv">foo.csv</a></p>';
@@ -90,4 +90,24 @@ test('extractZulipAttachments: trailing punctuation in markdown links is not con
   const refs = extractZulipAttachments(raw);
   assert.equal(refs.length, 1);
   assert.equal(refs[0].path, '/user_uploads/1/a.png');
+});
+
+// Raw markdown path (apply_markdown:false): history, backscroll and wake text.
+// Nothing here is HTML, so angle brackets are the author's own text (#24).
+test('cleanMarkdown: XML inside a fenced block survives untouched', () => {
+  const raw = 'new mapping:\n```\n<tag_mapping>\n  <tag fix="6001" field="PERSIST_STR"/>\n</tag_mapping>\n```';
+  assert.equal(cleanMarkdown(raw), raw);
+});
+
+test('cleanMarkdown: inline generics and comparisons survive', () => {
+  assert.equal(cleanMarkdown('use Map<string, T> when a < b > c'), 'use Map<string, T> when a < b > c');
+});
+
+test('cleanMarkdown: mentions and upload links stay textual', () => {
+  const raw = '@**Alice** see [data.json](/user_uploads/x/data.json)';
+  assert.equal(cleanMarkdown(raw), raw);
+});
+
+test('cleanMarkdown: normalises CRLF and trims', () => {
+  assert.equal(cleanMarkdown('  a\r\nb\r\n'), 'a\nb');
 });
