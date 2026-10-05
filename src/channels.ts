@@ -104,6 +104,9 @@ export class ChannelManager {
   /** Per-channel routing hints from the most recent incoming message,
    *  so publishes can land in the active thread/topic. */
   private lastIncoming = new Map<string, RoutingHints>();
+  /** Per-channel topic the current typing run started in, so a refresh that
+   *  moves to a newer topic, and the final stop, cancel it there. */
+  private typingTopic = new Map<string, string | undefined>();
 
   /**
    * @param grant the effective capability grant for this connection (§5.4).
@@ -551,7 +554,29 @@ export class ChannelManager {
     if (!this.grant.has('channels.typing')) throw capabilityDenied('channels.typing');
     const adapter = this.adapterFor(channelId);
     if (!adapter?.sendTyping) return;
-    await adapter.sendTyping(channelId, this.allChannels.get(channelId), metadata, op);
+    const descriptor = this.allChannels.get(channelId);
+    // A topic the host names wins. Like publish, a host that names none means
+    // the conversation's current one, the topic of the newest incoming message.
+    // The host may send refreshes and the stop with the channel alone, so a run
+    // that a newer message moved must be stopped where it started, or it
+    // lingers there.
+    const hostTopic = metadata?.topic;
+    const named = typeof hostTopic === 'string';
+    const at = (topic: string | undefined) => (topic === undefined ? metadata : { ...metadata, topic });
+    const current = named ? hostTopic : this.lastIncoming.get(channelId)?.threadId;
+    const running = this.typingTopic.has(channelId);
+    const started = this.typingTopic.get(channelId);
+    if (op === 'stop') {
+      this.typingTopic.delete(channelId);
+      // A channel-only stop cancels the run where it is; a named stop cancels
+      // that topic too.
+      if (running && (!named || started !== current)) await adapter.sendTyping(channelId, descriptor, at(started), 'stop');
+      if (named || !running) await adapter.sendTyping(channelId, descriptor, at(current), 'stop');
+      return;
+    }
+    if (running && started !== current) await adapter.sendTyping(channelId, descriptor, at(started), 'stop');
+    this.typingTopic.set(channelId, current);
+    await adapter.sendTyping(channelId, descriptor, at(current), 'start');
   }
 
   /**
@@ -631,6 +656,7 @@ export class ChannelManager {
     this.openChannels.clear();
     this.batchBuffer.clear();
     this.lastIncoming.clear();
+    this.typingTopic.clear();
     // Announcement bookkeeping belongs to the peer that was there: a backlog
     // carried across would announce to the NEXT host a channel this server
     // may no longer even see, and a refusal was that host's policy, not this
