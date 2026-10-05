@@ -47,6 +47,8 @@ export interface ZulipEventMessage {
   content: string;
   timestamp: number;
   type: string;
+  /** Present on stream messages; absent on direct messages. */
+  stream_id?: number;
 }
 
 /** `flags` are the receiving user's message flags from the event envelope

@@ -388,3 +388,153 @@ test('policy is rechecked at send time: withheld messages are reported, and a ba
     console.error = original;
   }
 });
+
+// ── Announcing channels that appear after startup (#20) ──
+
+function desc(id: string): ChannelDescriptor {
+  return { id, type: 'zulip', label: `#${id.slice('zulip:'.length)}`, direction: 'bidirectional', address: { stream_name: id.slice('zulip:'.length) } };
+}
+
+/** A ChannelManager whose host answers `channels/changed` however the test says. */
+function announcing(answer: () => unknown) {
+  const sent: ChannelDescriptor[][] = [];
+  const host = {
+    registerChannels: async () => ({}),
+    channelsChanged: async (params: { added?: ChannelDescriptor[] }) => {
+      sent.push(params.added ?? []);
+      const result = answer();
+      if (result instanceof Error) throw result;
+      return result;
+    },
+    sendIncoming: async () => {},
+  } as never;
+  const { adapter } = fakeAdapter('zulip', []);
+  const manager = new ChannelManager(host, new Map([['zulip', adapter]]), grantedChannels(), 5);
+  return { manager, sent };
+}
+
+const acceptAll = (added: ChannelDescriptor[]) => ({ results: added.map((c) => ({ id: c.id, accepted: true })) });
+
+test('a host that never answers keeps the channel usable, retries it only when asked, and the backlog is bounded (#20)', async () => {
+  const { manager, sent } = announcing(() => new Error('timed out'));
+  const first = await manager.registerAdditional([desc('zulip:ops')]);
+  assert.deepEqual(first, { announced: [], local: ['zulip:ops'], refused: [], reason: 'timed out' });
+  assert.ok(manager.getChannel('zulip:ops'), 'usable here: the host never said no');
+
+  // The message path must not drag the backlog into a delivery-time request.
+  await manager.registerAdditional([desc('zulip:dev')]);
+  assert.deepEqual(sent[1].map((c) => c.id), ['zulip:dev'], 'only the new channel');
+
+  // An explicit refresh retries everything pending, in one request.
+  await manager.registerAdditional([], { retryBacklog: true });
+  assert.deepEqual(sent[2].map((c) => c.id).sort(), ['zulip:dev', 'zulip:ops']);
+
+  // Bounded: 200 unanswered channels do not grow the retry set past the cap.
+  for (let i = 0; i < 200; i++) await manager.registerAdditional([desc(`zulip:s${i}`)]);
+  const backlog = await manager.registerAdditional([], { retryBacklog: true });
+  assert.equal(backlog.local.length, 100, 'exactly the cap, oldest dropped');
+  assert.equal(manager.getChannel('zulip:s0') !== undefined, true, 'an evicted channel stays usable, it is just no longer retried');
+});
+
+test('a host that itemizes only what it changed has not refused the rest (#20)', async () => {
+  const { manager } = announcing(() => ({ results: [{ id: 'zulip:ops', accepted: true }] }));
+  const result = await manager.registerAdditional([desc('zulip:ops'), desc('zulip:dev')]);
+  assert.deepEqual(result.announced, ['zulip:ops']);
+  assert.deepEqual(result.refused, [], 'silence about #dev is not a refusal');
+  assert.deepEqual(result.local, ['zulip:dev']);
+  assert.ok(manager.getChannel('zulip:dev'), 'and #dev stays usable, pending another answer');
+});
+
+test('an itemized refusal unregisters the channel, closes it, and is not asked again until the agent asks (#20)', async () => {
+  const { manager, sent } = announcing(() => ({ results: [{ id: 'zulip:ops', accepted: false, reason: 'not subscribed' }] }));
+  const result = await manager.registerAdditional([desc('zulip:ops')]);
+  assert.deepEqual(result.refused, ['zulip:ops']);
+  assert.equal(manager.getChannel('zulip:ops'), undefined);
+  assert.equal(manager.isOpen('zulip:ops'), false, 'no registry/lifecycle split brain');
+
+  // Later messages from that stream carry the descriptor again; the host is not re-asked.
+  await manager.registerAdditional([desc('zulip:ops')]);
+  await manager.registerAdditional([desc('zulip:ops')]);
+  assert.equal(sent.length, 1, 'the refusal is remembered');
+
+  // Until the agent explicitly refreshes.
+  await manager.registerAdditional([desc('zulip:ops')], { retryRefused: true });
+  assert.equal(sent.length, 2);
+});
+
+test('a refusal of a channel the host had already accepted does not unregister it (#20)', async () => {
+  let accepted = true;
+  const { manager } = announcing(() => (accepted
+    ? { results: [{ id: 'zulip:ops', accepted: true }] }
+    : { results: [{ id: 'zulip:ops', accepted: false }] }));
+  await manager.registerAdditional([desc('zulip:ops')]);
+  manager.openChannel({ channelId: 'zulip:ops', type: 'zulip' });
+  accepted = false;
+  await manager.registerAdditional([{ ...desc('zulip:ops'), label: '#ops renamed' }], { retryRefused: true });
+  assert.ok(manager.getChannel('zulip:ops'), 'an open, previously accepted channel is not yanked out from under delivery');
+  assert.equal(manager.isOpen('zulip:ops'), true);
+});
+
+test('the announcement backlog belongs to the connection that was there (#20)', async () => {
+  const { manager, sent } = announcing(() => new Error('timed out'));
+  await manager.registerAdditional([desc('zulip:gone')]);
+  assert.equal(manager.getChannel('zulip:gone') !== undefined, true);
+
+  manager.reset(); // the host disconnected
+  assert.equal(manager.getChannel('zulip:gone'), undefined);
+
+  // A new peer must not be told about a channel this server no longer sees.
+  await manager.registerAdditional([desc('zulip:dev')], { retryBacklog: true });
+  assert.deepEqual(sent[1].map((c) => c.id), ['zulip:dev']);
+});
+
+test('two callers announcing the same new channel send one announcement (#20)', async () => {
+  const { manager, sent } = announcing(() => acceptAll([desc('zulip:ops')]));
+  const [a, b] = await Promise.all([
+    manager.registerAdditional([desc('zulip:ops')]),
+    manager.registerAdditional([desc('zulip:ops')]),
+  ]);
+  assert.equal(sent.length, 1, 'the second caller saw the first one in flight');
+  assert.deepEqual([a.announced, b.announced].flat(), ['zulip:ops']);
+});
+
+test('a refusal that arrives on the retry is a refusal, not a contradiction (#20)', async () => {
+  // The descriptor is recorded before the announcement, so "already in
+  // allChannels" cannot mean "the host accepted it" — only a verdict can.
+  let answer: unknown = new Error('timed out');
+  const { manager } = announcing(() => answer);
+  const first = await manager.registerAdditional([desc('zulip:ops')]);
+  assert.deepEqual(first.local, ['zulip:ops']);
+
+  answer = { results: [{ id: 'zulip:ops', accepted: false, reason: 'not yours' }] };
+  const retry = await manager.registerAdditional([], { retryBacklog: true });
+  assert.deepEqual(retry.refused, ['zulip:ops']);
+  assert.deepEqual(retry.announced, [], 'never accepted, so this is not a host contradiction');
+  assert.equal(manager.getChannel('zulip:ops'), undefined);
+});
+
+test('retrying a refused channel does not forget the refusal when the retry goes unanswered (#20)', async () => {
+  let answer: unknown = { results: [{ id: 'zulip:ops', accepted: false }] };
+  const { manager, sent } = announcing(() => answer);
+  await manager.registerAdditional([desc('zulip:ops')]);
+  assert.equal(manager.getChannel('zulip:ops'), undefined);
+
+  answer = new Error('timed out');
+  const retried = await manager.registerAdditional([desc('zulip:ops')], { retryRefused: true });
+  assert.deepEqual(retried.refused, ['zulip:ops'], 'silence does not promote a refusal into a registration');
+  assert.deepEqual(retried.local, []);
+  assert.equal(manager.getChannel('zulip:ops'), undefined);
+
+  // Still refused: the automatic paths do not ask again.
+  const after = sent.length;
+  await manager.registerAdditional([desc('zulip:ops')]);
+  assert.equal(sent.length, after);
+});
+
+test('a host that acts on a pending channel has confirmed it (#20)', async () => {
+  const { manager, sent } = announcing(() => new Error('timed out'));
+  await manager.registerAdditional([desc('zulip:ops')]);
+  manager.confirmAnnounced('zulip:ops'); // the host opened or closed it
+  await manager.registerAdditional([], { retryBacklog: true });
+  assert.equal(sent.length, 1, 'nothing left to re-announce');
+});

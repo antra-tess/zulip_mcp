@@ -221,6 +221,67 @@ test('without a realm there is no uploader: attachments error clearly and plain 
   }
 });
 
+// ── listen registers what it joined (#20) ──
+
+test('listen reports subscriptions to the server and carries the registration outcome back to the agent (#20)', async () => {
+  const calls: unknown[] = [];
+  const client = {
+    users: { me: { subscriptions: { add: async (p: Record<string, unknown>) => {
+      calls.push(p);
+      return { result: 'success', subscribed: { '790': ['ops'] }, already_subscribed: {}, unauthorized: ['secret'] };
+    } } } },
+  };
+  const { tools, dir } = runtime(client);
+  const seen: string[][] = [];
+  try {
+    tools.onSubscribed = (streams) => {
+      seen.push(streams);
+      return { announced: [], local: ['zulip:ops'], refused: [], reason: 'timed out' };
+    };
+    const out = await tools.handleToolCall('listen', { channels: ['ops', 'secret'] });
+    assert.deepEqual(seen, [['ops']], 'a stream the bot was not authorized to join is not registered');
+    assert.deepEqual(out.registration, { announced: [], local: ['zulip:ops'], refused: [], reason: 'timed out' });
+    assert.match(out.note, /did not confirm zulip:ops \(timed out\)/, 'the agent is told, instead of it going to stderr');
+
+    // The hook is awaited: `listen` answers after registration, not before.
+    let settled = false;
+    tools.onSubscribed = async () => {
+      await new Promise((r) => setTimeout(r, 20));
+      settled = true;
+      return { announced: ['zulip:ops'], local: [], refused: [] };
+    };
+    const awaited = await tools.handleToolCall('listen', { channels: ['ops'] });
+    assert.equal(settled, true);
+    assert.match(awaited.note, /Registered 1 channel/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('listen does not register anything when Zulip refused the subscription (#20)', async () => {
+  const client = {
+    users: { me: { subscriptions: { add: async () => ({ result: 'success', subscribed: {}, already_subscribed: {}, unauthorized: ['secret'] }) } } },
+  };
+  const { tools, dir } = runtime(client);
+  let called = 0;
+  try {
+    tools.onSubscribed = () => { called++; };
+    const out = await tools.handleToolCall('listen', { channels: ['secret'] });
+    assert.equal(called, 0, 'nothing was joined, so there is nothing to register');
+    assert.equal(out.registration, undefined);
+    assert.deepEqual(out.unauthorized, ['secret']);
+
+    // An error from Zulip is reported as such, and registers nothing.
+    const failing = runtime({ users: { me: { subscriptions: { add: async () => { throw new Error('nope'); } } } } });
+    failing.tools.onSubscribed = () => { called++; };
+    assert.match((await failing.tools.handleToolCall('listen', { channels: ['ops'] })).error, /nope/);
+    assert.equal(called, 0);
+    rmSync(failing.dir, { recursive: true, force: true });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('delete_message notes the id before the call and un-notes it when the call fails (#22)', async () => {
   const noted: string[] = [];
   const failed: string[] = [];
