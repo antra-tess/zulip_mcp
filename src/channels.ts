@@ -86,6 +86,9 @@ export class ChannelManager {
   /** Per-channel routing hints from the most recent incoming message,
    *  so publishes can land in the active thread/topic. */
   private lastIncoming = new Map<string, RoutingHints>();
+  /** Per-channel topic the current typing run started in, so a refresh that
+   *  moves to a newer topic, and the final stop, cancel it there. */
+  private typingTopic = new Map<string, string | undefined>();
 
   /**
    * @param grant the effective capability grant for this connection (§5.4).
@@ -362,12 +365,23 @@ export class ChannelManager {
     if (!this.grant.has('channels.typing')) throw capabilityDenied('channels.typing');
     const adapter = this.adapterFor(channelId);
     if (!adapter?.sendTyping) return;
+    const descriptor = this.allChannels.get(channelId);
+    if (typeof metadata?.topic === 'string') return adapter.sendTyping(channelId, descriptor, metadata, op);
     // Like publish: a host that names no topic means the conversation's
-    // current one, the topic of the newest incoming message.
-    const last = this.lastIncoming.get(channelId);
-    const routed =
-      typeof metadata?.topic === 'string' || !last?.threadId ? metadata : { ...metadata, topic: last.threadId };
-    await adapter.sendTyping(channelId, this.allChannels.get(channelId), routed, op);
+    // current one, the topic of the newest incoming message. The host sends
+    // every refresh and the stop with the channel alone, so a run that a newer
+    // message moved must be stopped where it started, or it lingers there.
+    const at = (topic: string | undefined) => (topic === undefined ? metadata : { ...metadata, topic });
+    const current = this.lastIncoming.get(channelId)?.threadId;
+    const running = this.typingTopic.has(channelId);
+    const started = this.typingTopic.get(channelId);
+    if (op === 'stop') {
+      this.typingTopic.delete(channelId);
+      return adapter.sendTyping(channelId, descriptor, at(running ? started : current), 'stop');
+    }
+    if (running && started !== current) await adapter.sendTyping(channelId, descriptor, at(started), 'stop');
+    this.typingTopic.set(channelId, current);
+    await adapter.sendTyping(channelId, descriptor, at(current), 'start');
   }
 
   /**
@@ -447,6 +461,7 @@ export class ChannelManager {
     this.openChannels.clear();
     this.batchBuffer.clear();
     this.lastIncoming.clear();
+    this.typingTopic.clear();
   }
 
   // -- Private --

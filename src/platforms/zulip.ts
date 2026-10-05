@@ -653,13 +653,14 @@ export class ZulipAdapter implements PlatformAdapter {
   /**
    * Best-effort typing indicator.
    *
-   * Routing metadata travels with the notification; the host (via whatever
-   * inference logic it uses — most commonly the most recent incoming message
-   * on this channel) provides a `topic` key pointing at the active Zulip
-   * thread. Falls back to 'mcpl' if the host didn't provide one.
+   * Stream typing goes to `metadata.topic`. ChannelManager.sendTyping fills
+   * it in when the host names none (the topic of the newest incoming message)
+   * and stops a run in the topic it started in; falls back to 'mcpl' only
+   * when there is still no topic.
    *
-   * Zulip typing events auto-expire server-side (~15s), so there's no stop op;
-   * the host refreshes every 7s while inference is active.
+   * `op` is passed through: 'start' while the host refreshes (every ~7s
+   * during inference), 'stop' when the turn ends. Zulip expires a start that
+   * is never stopped on its own, so a missed stop lingers but does not stick.
    *
    * Note: zulip-js's `typing.send` unconditionally dereferences `params.to.length`,
    * so we must pass `to: []` even for the stream form — otherwise the library

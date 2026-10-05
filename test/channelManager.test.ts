@@ -8,6 +8,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { ChannelManager } from '../src/channels.ts';
 import { CapabilityGrant } from '../src/grant.ts';
+import { normalizeMessage, toIncoming, type ZulipRawMessage } from '../src/history.ts';
 import type { PlatformAdapter, RoutingHints } from '../src/platforms/adapter.ts';
 import type { ChannelDescriptor, ContentBlock } from '@animalabs/mcpl-core';
 
@@ -120,14 +121,26 @@ function makeTypingManager() {
   return { manager, typed };
 }
 
-const supportMessage = (topic: string) => ({
-  channelId: 'zulip:support',
-  messageId: '42',
-  threadId: topic,
-  author: { id: '1', name: 'alice' },
-  timestamp: new Date(0).toISOString(),
-  content: [{ type: 'text' as const, text: 'question' }],
-});
+/** A message as the Zulip adapter delivers it, `metadata.topic` included. */
+function zulipMessage(channelId: string, over: Partial<ZulipRawMessage> = {}) {
+  return toIncoming(channelId, normalizeMessage({
+    id: 42,
+    sender_id: 1,
+    sender_full_name: 'alice',
+    sender_email: 'alice@example.com',
+    display_recipient: 'support',
+    subject: 'router A',
+    content: 'question',
+    timestamp: 1_700_000_000,
+    type: 'stream',
+    ...over,
+  }), { selfUserId: 790, sessionId: 's' });
+}
+
+const supportMessage = (topic: string) => zulipMessage('zulip:support', { subject: topic });
+
+const typedOps = (typed: { metadata?: Record<string, unknown>; op: string }[]) =>
+  typed.map((t) => [t.metadata?.topic, t.op]);
 
 test('typing without a topic from the host goes to the topic of the newest incoming message', async () => {
   const { manager, typed } = makeTypingManager();
@@ -136,7 +149,80 @@ test('typing without a topic from the host goes to the topic of the newest incom
   manager.onIncomingMessage('zulip:support', supportMessage('router A'));
   await manager.sendTyping('zulip:support');
   await manager.sendTyping('zulip:support', undefined, 'stop');
-  assert.deepEqual(typed.map((t) => [t.metadata?.topic, t.op]), [['router A', 'start'], ['router A', 'stop']]);
+  assert.deepEqual(typedOps(typed), [['router A', 'start'], ['router A', 'stop']]);
+  manager.destroy();
+});
+
+test('a newer message in another topic stops typing where it started before starting there', async () => {
+  const { manager, typed } = makeTypingManager();
+  await manager.registerChannels();
+  manager.openChannel({ type: 'zulip' });
+  manager.onIncomingMessage('zulip:support', supportMessage('router A'));
+  await manager.sendTyping('zulip:support');
+  manager.onIncomingMessage('zulip:support', { ...supportMessage('router B'), messageId: '43' });
+  await manager.sendTyping('zulip:support'); // the ~7s refresh
+  await manager.sendTyping('zulip:support');
+  manager.onIncomingMessage('zulip:support', { ...supportMessage('router A'), messageId: '44' });
+  await manager.sendTyping('zulip:support', undefined, 'stop');
+  assert.deepEqual(typedOps(typed), [
+    ['router A', 'start'],
+    ['router A', 'stop'], ['router B', 'start'],
+    ['router B', 'start'],
+    ['router B', 'stop'],
+  ]);
+  manager.destroy();
+});
+
+test('a reaction or change marker does not retarget typing', async () => {
+  const { manager, typed } = makeTypingManager();
+  await manager.registerChannels();
+  manager.openChannel({ type: 'zulip' });
+  manager.onIncomingMessage('zulip:support', supportMessage('router A'));
+  await manager.sendTyping('zulip:support');
+  const marker = { channelId: 'zulip:support', author: { id: '2', name: 'bob' }, timestamp: new Date(0).toISOString(), content: [{ type: 'text' as const, text: '[marker]' }] };
+  manager.onIncomingMessage('zulip:support', { ...marker, messageId: 'reaction:add:42:2:0', metadata: { reaction: true } });
+  manager.onIncomingMessage('zulip:support', { ...marker, messageId: 'move:42:0.1', metadata: { change: 'move', topic: 'archive' } });
+  await manager.sendTyping('zulip:support');
+  await manager.sendTyping('zulip:support', undefined, 'stop');
+  assert.deepEqual(typedOps(typed), [['router A', 'start'], ['router A', 'start'], ['router A', 'stop']]);
+  manager.destroy();
+});
+
+test('typing in a DM carries no topic and sends no extra stops', async () => {
+  const dm: ChannelDescriptor = { id: 'zulip:dm:1+790', type: 'zulip', label: 'DM: alice', direction: 'bidirectional' };
+  const { adapter } = fakeAdapter('zulip', [dm]);
+  const typed: { metadata?: Record<string, unknown>; op: string }[] = [];
+  adapter.sendTyping = async (_c, _d, metadata, op) => { typed.push({ metadata, op }); };
+  const grant = grantedChannels();
+  grant.apply({ effectiveCapabilities: ['channels.register', 'channels.lifecycle', 'channels.publish', 'channels.incoming', 'channels.typing'] });
+  const manager = new ChannelManager(fakeMcplClient, new Map([['zulip', adapter]]), grant, 10);
+  await manager.registerChannels();
+  manager.openChannel({ type: 'zulip' });
+  const fromAlice = (id: number) => zulipMessage('zulip:dm:1+790', {
+    id, type: 'private', subject: '', display_recipient: [{ id: 1, email: 'alice@example.com', full_name: 'alice' }],
+  });
+  manager.onIncomingMessage('zulip:dm:1+790', fromAlice(1));
+  await manager.sendTyping('zulip:dm:1+790');
+  manager.onIncomingMessage('zulip:dm:1+790', fromAlice(2));
+  await manager.sendTyping('zulip:dm:1+790');
+  await manager.sendTyping('zulip:dm:1+790', undefined, 'stop');
+  assert.deepEqual(typedOps(typed), [[undefined, 'start'], [undefined, 'start'], [undefined, 'stop']]);
+  manager.destroy();
+});
+
+test('reset() forgets the topic a typing run started in', async () => {
+  const { manager, typed } = makeTypingManager();
+  await manager.registerChannels();
+  manager.openChannel({ type: 'zulip' });
+  manager.onIncomingMessage('zulip:support', supportMessage('router A'));
+  await manager.sendTyping('zulip:support');
+  manager.reset();
+  await manager.registerChannels();
+  manager.openChannel({ type: 'zulip' });
+  manager.onIncomingMessage('zulip:support', supportMessage('router B'));
+  await manager.sendTyping('zulip:support');
+  // A new connection's run: no stop for the old connection's topic.
+  assert.deepEqual(typedOps(typed), [['router A', 'start'], ['router B', 'start']]);
   manager.destroy();
 });
 
