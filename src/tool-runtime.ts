@@ -34,6 +34,14 @@ import {
   type Uploader,
 } from "./uploads.js";
 
+/** What registering the streams `listen` joined achieved (MCPL mode only). */
+export interface SubscriptionRegistration {
+  announced: string[];
+  local: string[];
+  refused: string[];
+  reason?: string;
+}
+
 /** A message this server sent through a tool — recorded for rollback. */
 export interface SentRecord {
   messageId: string;
@@ -229,6 +237,12 @@ export class ZulipToolRuntime {
    *  someone else's later deletion must surface. */
   onDeleteFailed: ((messageId: string) => void) | null = null;
 
+  /** Set by the MCPL server: streams `listen` just subscribed the bot to, so
+   *  they can be registered without waiting for a refresh or an event (#20).
+   *  Awaited, and its result is reported by `listen`: an announcement the
+   *  host did not confirm is the agent's business, not a stderr line. */
+  onSubscribed: ((streams: string[]) => SubscriptionRegistration | Promise<SubscriptionRegistration | void> | void) | null = null;
+
   private readonly uploader: Uploader | null;
   private readonly uploadPolicy: UploadPolicy;
   /** Line time for fetch_history / fetch_around, shared with live delivery. */
@@ -405,12 +419,32 @@ export class ZulipToolRuntime {
           const result = await zulipClient.users.me.subscriptions.add({
             subscriptions: channels.map(name => ({ name })),
           });
+          // A stream the bot just joined is not in the host's channel list
+          // yet; registering it here is what makes it openable without a
+          // refresh or a restart (#20).
+          const unauthorized: string[] = Array.isArray(result?.unauthorized) ? result.unauthorized : [];
+          const joined = channels.filter((name) => !unauthorized.includes(name));
+          const registration = result?.result === "success" && joined.length > 0
+            ? await this.onSubscribed?.(joined)
+            : undefined;
           return {
             result: result?.result,
             subscribed: result?.subscribed ?? {},
             already_subscribed: result?.already_subscribed ?? {},
             unauthorized: result?.unauthorized ?? [],
             msg: result?.msg,
+            ...(registration
+              ? {
+                  registration,
+                  note: registration.announced.length > 0
+                    ? `Registered ${registration.announced.length} channel(s) with the host; they can be opened now.`
+                    : registration.refused.length > 0
+                      ? `The host refused ${registration.refused.join(", ")}.`
+                      : registration.local.length > 0
+                        ? `The host did not confirm ${registration.local.join(", ")} (${registration.reason ?? "no answer"}); usable here and re-announced on the next refresh.`
+                        : undefined,
+                }
+              : {}),
           };
         } catch (error) {
           return {

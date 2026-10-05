@@ -11,6 +11,7 @@ import assert from 'node:assert/strict';
 import { ZulipAdapter, type FilterView } from '../src/platforms/zulip.ts';
 import type { MessageChangeEvent } from '../src/platforms/adapter.ts';
 import type { ZulipRawMessage } from '../src/history.ts';
+import type { ChannelDescriptor } from '@animalabs/mcpl-core';
 
 const SELF = 790;
 
@@ -146,6 +147,77 @@ test('publish uploads image blocks and links them after the text; without an upl
   await plain.publish('zulip:general', undefined, blocks);
   assert.equal(sends[2].content, 'chart attached');
   assert.equal((await plain.publish('zulip:general', undefined, [blocks[1]])).delivered, false);
+});
+
+// ── Streams joined after startup (#20) ──
+
+/** A client whose event queue delivers `events` once, then parks. `visible`
+ *  is what stream discovery answers. */
+function eventingClient(rows: ZulipRawMessage[], events: { message: Record<string, unknown>; flags?: string[] }[], visible: { name: string; stream_id: number }[] = []) {
+  const { client } = fakeClient(rows);
+  let served = false;
+  return {
+    ...client,
+    streams: { retrieve: async () => ({ result: 'success', streams: visible }) },
+    queues: { register: async () => ({ queue_id: 'q1', last_event_id: -1 }) },
+    events: {
+      retrieve: async () => {
+        if (served) return new Promise(() => {}); // park: the test is done polling
+        served = true;
+        return { result: 'success', events: events.map((e, i) => ({ id: i + 1, type: 'message', message: e.message, flags: e.flags ?? [] })) };
+      },
+    },
+  };
+}
+
+function streamEvent(id: number, stream: string, streamId: number | undefined, over: Record<string, unknown> = {}) {
+  return {
+    message: {
+      id, sender_id: 7, sender_full_name: 'Ann', sender_email: 'ann@example.com',
+      display_recipient: stream, subject: 'incidents', content: 'hello', timestamp: 1_700_000_000,
+      type: 'stream', ...(streamId === undefined ? {} : { stream_id: streamId }), ...over,
+    },
+    flags: ['mentioned'],
+  };
+}
+
+test('every stream message carries its stream descriptor, so a stream joined after startup can be registered (#20)', async () => {
+  const client = eventingClient([], [streamEvent(900, 'ops', 12), streamEvent(901, 'ops', 12), streamEvent(902, 'general', 7)]);
+  const adapter = new ZulipAdapter(client, SELF, 's');
+  const seen: { channelId: string; descriptor?: string }[] = [];
+  adapter.startEvents((m, descriptor) => seen.push({ channelId: m.channelId, descriptor: descriptor?.id }));
+  await new Promise((r) => setTimeout(r, 50));
+  adapter.stopEvents();
+
+  assert.deepEqual(seen.map((s) => s.channelId), ['zulip:ops', 'zulip:ops', 'zulip:general']);
+  // Every message, not just the first: what is already registered is the
+  // server's decision, and its registry is cleared on every reconnect.
+  assert.deepEqual(seen.map((s) => s.descriptor), ['zulip:ops', 'zulip:ops', 'zulip:general']);
+});
+
+test('the descriptor a message carries matches the one discovery builds for the same stream (#20)', async () => {
+  const client = eventingClient([], [streamEvent(900, 'general', 7)], [{ name: 'general', stream_id: 7 }]);
+  const adapter = new ZulipAdapter(client, SELF, 's');
+  const discovered = (await adapter.discoverChannels()).find((c) => c.id === 'zulip:general')!;
+  let fromEvent: ChannelDescriptor | undefined;
+  adapter.startEvents((_m, descriptor) => { fromEvent = descriptor; });
+  await new Promise((r) => setTimeout(r, 50));
+  adapter.stopEvents();
+  assert.ok(fromEvent);
+  assert.equal(fromEvent!.id, discovered.id);
+  assert.equal(fromEvent!.label, discovered.label);
+  assert.deepEqual(fromEvent!.address, discovered.address);
+  assert.deepEqual(fromEvent!.capabilities, discovered.capabilities);
+});
+
+test('a descriptor built from an event without a stream_id still addresses the stream (#20)', async () => {
+  const client = eventingClient([], [streamEvent(900, 'ops', undefined)]);
+  const adapter = new ZulipAdapter(client, SELF, 's');
+  const seen: { id: string; address: unknown }[] = [];
+  adapter.startEvents((_m, descriptor) => { if (descriptor) seen.push({ id: descriptor.id, address: descriptor.address }); });
+  await new Promise((r) => setTimeout(r, 50));
+  adapter.stopEvents();
+  assert.deepEqual(seen, [{ id: 'zulip:ops', address: { stream_name: 'ops', stream_id: undefined } }]);
 });
 
 test('edits, moves and deletions are placed, cleaned and filtered before reaching the server (#22)', async () => {
@@ -384,7 +456,7 @@ test('a change to the bot\'s own DM message is judged by whom it was sent to', a
   assert.equal(await run({ streamAllowed: () => true, dmAllowed: (u) => u.id === 999 }), 0, 'no counterpart is: the bot\'s own authorship is no pass');
 });
 
-test('a message from a stream created after startup carries its descriptor, once', async () => {
+test('a message from a stream created after startup carries its descriptor, with the stream id; a filtered stream carries nothing', async () => {
   // Discovery saw only #general; #late-stream is created later and its
   // first message (a mention of the bot) arrives live.
   const events = [
@@ -422,12 +494,12 @@ test('a message from a stream created after startup carries its descriptor, once
   } finally {
     console.error = original;
   }
+  // Every allowed stream message carries its descriptor — whether it is new
+  // is the server's registry's call, not the adapter's.
   assert.deepEqual(seen, [
-    // Known from discovery: nothing to announce.
-    { id: '10', channelId: 'zulip:general', newChannel: undefined, address: undefined },
-    // New: described from the message, with the stream id publishing needs.
+    { id: '10', channelId: 'zulip:general', newChannel: 'zulip:general', address: { stream_name: 'general', stream_id: undefined } },
+    // Described from the message, with the stream id publishing needs.
     { id: '11', channelId: 'zulip:late-stream', newChannel: 'zulip:late-stream', address: { stream_name: 'late-stream', stream_id: 9 } },
-    // Already described: not announced again.
-    { id: '12', channelId: 'zulip:late-stream', newChannel: undefined, address: undefined },
+    { id: '12', channelId: 'zulip:late-stream', newChannel: 'zulip:late-stream', address: { stream_name: 'late-stream', stream_id: 9 } },
   ]);
 });
