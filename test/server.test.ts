@@ -44,7 +44,7 @@ const DESCRIPTOR: ChannelDescriptor = {
 
 interface FakeAdapter extends PlatformAdapter {
   published: { channelId: string; content: ContentBlock[]; hints?: RoutingHints }[];
-  typing: { channelId: string; op: string }[];
+  typing: { channelId: string; op: string; metadata?: Record<string, unknown> }[];
   emit: OnIncomingMessage | null;
   systemEvent: OnSystemEvent | null;
   react: OnReaction | null;
@@ -120,7 +120,7 @@ function fakeAdapter(withTyping = true): FakeAdapter {
     stopEvents() { adapter.emit = null; },
   };
   if (withTyping) {
-    adapter.sendTyping = async (channelId, _d, _m, op) => { adapter.typing.push({ channelId, op }); };
+    adapter.sendTyping = async (channelId, _d, m, op) => { adapter.typing.push({ channelId, op, metadata: m as Record<string, unknown> | undefined }); };
   }
   return adapter;
 }
@@ -162,7 +162,7 @@ interface Harness {
   served: Promise<void>;
   /** How the host answers channels/incoming: per-message rejections (for
    *  good, or once), and whole batches that error out (counted down per batch). */
-  policy: { rejectIds: Set<string>; rejectOnce: Set<string>; failIncomingBatches: number; changedAnswer: 'accept' | 'refuse' | 'error' | 'reconcile'; reconcileOpens: { channelId: string; ok: boolean; detail: string }[] };
+  policy: { rejectIds: Set<string>; rejectOnce: Set<string>; failIncomingBatches: number; changedAnswer: 'accept' | 'refuse' | 'error' | 'reconcile'; reconcileOpens: { channelId: string; ok: boolean; detail: string }[]; rejectPushes: Set<string> };
   close(): Promise<void>;
 }
 
@@ -213,6 +213,7 @@ function harness(opts: HarnessOptions = {}): Harness {
     failIncomingBatches: 0,
     changedAnswer: 'accept' as 'accept' | 'refuse' | 'error' | 'reconcile',
     reconcileOpens: [] as { channelId: string; ok: boolean; detail: string }[],
+    rejectPushes: new Set<string>(),
   };
   // The host reactor: answer every server→host Request the way conhost does.
   host.on('request', (req) => {
@@ -231,8 +232,9 @@ function harness(opts: HarnessOptions = {}): Harness {
       incoming.push(...p.messages.filter((m) => !refused.has(m.messageId)));
       host.sendResponse(req.id, { results: p.messages.map((m) => ({ messageId: m.messageId, accepted: !refused.has(m.messageId) })) });
     } else if (req.method === method.PUSH_EVENT) {
-      pushed.push(req.params as PushEventParams);
-      host.sendResponse(req.id, { accepted: true });
+      const p = req.params as PushEventParams;
+      pushed.push(p);
+      host.sendResponse(req.id, { accepted: !policy.rejectPushes.has(String((p.origin as { messageId?: unknown }).messageId)) });
     } else if (req.method === method.CHANNELS_CHANGED) {
       const p = req.params as { added?: ChannelDescriptor[] };
       // 'error' stands for every host that does not answer this Request:
@@ -687,6 +689,61 @@ test('a mention on a closed channel is pushed, ambient is tallied, and channel_m
   await h.close();
 });
 
+test('an answer in a closed stream goes to the topic of the mention the host accepted as a push', async () => {
+  const answer = async (h: Harness, text: string) => {
+    await h.host.sendRequest(method.CHANNELS_PUBLISH, { conversationId: 'c1', channelId: 'zulip:general', content: [{ type: 'text', text }] });
+    const hints = h.adapter.published.at(-1)?.hints;
+    return { threadId: hints?.threadId, topic: (hints?.metadata as { topic?: string } | undefined)?.topic };
+  };
+  const mention = (id: number, topic: string) =>
+    streamMsg(id, { mentioned: true, text: `@bot a question in ${topic}`, threadId: topic, metadata: { topic, mentioned: true, isDM: false } });
+
+  // A stream the agent had open, its last message in "deploys", then closed.
+  const h = harness();
+  await initialize(h, true);
+  await settled(h);
+  await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+  h.adapter.emit!(streamMsg(1));
+  await until(() => h.incoming.length === 1, 'open-channel delivery');
+  await h.host.sendRequest(method.CHANNELS_CLOSE, { channelId: 'zulip:general' });
+
+  // Each push is answered once the host has accepted it, as an agent answers
+  // what it was given: the watermark moves on that acceptance.
+  h.adapter.emit!(mention(2, 'billing'));
+  await until(() => h.server.delivery.watermark('zulip:general') === 2, 'the mention in billing accepted');
+  // Typing with no topic from the host follows the same hint.
+  await h.host.sendRequest(method.CHANNELS_TYPING, { channelId: 'zulip:general', op: 'start' });
+  await until(() => h.adapter.typing.length === 1, 'typing start');
+  assert.equal(h.adapter.typing[0].metadata?.topic, 'billing');
+  assert.deepEqual(await answer(h, 'about billing'), { threadId: 'billing', topic: 'billing' });
+  h.adapter.emit!(mention(3, 'support'));
+  await until(() => h.server.delivery.watermark('zulip:general') === 3, 'the mention in support accepted');
+  assert.deepEqual(await answer(h, 'about support'), { threadId: 'support', topic: 'support' });
+
+  // A message that doesn't address the agent isn't pushed, and moves nothing.
+  h.adapter.emit!(streamMsg(4, { text: 'chatter', threadId: 'chatter', metadata: { topic: 'chatter', mentioned: false, isDM: false } }));
+  await until(() => h.server.delivery.tally('zulip:general')?.talliedThrough === 4, 'the ambient message tallied');
+  assert.equal(h.pushed.length, 2, 'not pushed');
+  assert.deepEqual(await answer(h, 'still about support'), { threadId: 'support', topic: 'support' });
+
+  // A mention the host refuses never reached the agent, so it moves nothing.
+  h.policy.rejectPushes.add('5');
+  h.adapter.emit!(mention(5, 'random'));
+  await until(() => h.server.delivery.heldIds('zulip:general', { replayable: true }).includes(5), 'the refusal handled: held as failed');
+  assert.equal(h.server.delivery.watermark('zulip:general'), 3, 'refused: the watermark stays');
+  assert.deepEqual(await answer(h, 'and still about support'), { threadId: 'support', topic: 'support' });
+  await h.close();
+
+  // A stream never open: the first answer goes to the mention's topic too.
+  const g = harness();
+  await initialize(g, true);
+  await settled(g);
+  g.adapter.emit!(mention(5, 'billing'));
+  await until(() => g.server.delivery.watermark('zulip:general') === 5, 'the first contact accepted');
+  assert.deepEqual(await answer(g, 'first answer'), { threadId: 'billing', topic: 'billing' });
+  await g.close();
+});
+
 test('ZULIP_ATTRIBUTE_DELIVERY=false delivers bare bodies on every attributed surface: incoming, recovered replay, push', async () => {
   const h = harness({ attributeDelivery: false, history: [streamMsg(1), streamMsg(2), streamMsg(3)] });
   await initialize(h, true);
@@ -763,10 +820,19 @@ test('the reconnect sweep delivers what arrived while offline, by what the host 
     await first.close();
 
     // Session 2: new messages exist beyond both watermarks.
+    // dev's one mention is in "triage", and the talk after it in "chatter".
+    const devTopic = (id: number) => (id === 60 ? 'triage' : id > 60 ? 'chatter' : 'deploys');
     const later = [
       streamMsg(4, { text: 'while you were away' }),
       streamMsg(5, { mentioned: true, text: '@bot are you back?' }),
-      ...Array.from({ length: 20 }, (_, i) => streamMsg(51 + i, { channelId: 'zulip:dev', text: `dev ${51 + i}`, mentioned: 51 + i === 60 })),
+      streamMsg(6, { text: 'shipping now', threadId: 'release', metadata: { topic: 'release', mentioned: false, isDM: false } }),
+      ...Array.from({ length: 20 }, (_, i) => {
+        const id = 51 + i;
+        return streamMsg(id, {
+          channelId: 'zulip:dev', text: `dev ${id}`, mentioned: id === 60, threadId: devTopic(id),
+          metadata: { topic: devTopic(id), mentioned: id === 60, isDM: false },
+        });
+      }),
     ];
     const second = harness({ stateDir: dir, sessionId: 'sw', history: later });
     // dev must be a registered channel for the sweep to consider it.
@@ -777,9 +843,10 @@ test('the reconnect sweep delivers what arrived while offline, by what the host 
 
     const general = second.pushed.find((p) => (p.origin as { mcplChannelId: string }).mcplChannelId === 'zulip:general')!;
     const generalText = (general.payload.content[0] as { text: string }).text;
-    assert.match(generalText, /^<missed stream="#general" channelId="zulip:general" count="2" reason="backscroll">/);
+    assert.match(generalText, /^<missed stream="#general" channelId="zulip:general" count="3" reason="backscroll">/);
     assert.match(generalText, /\[T id=4\] \[#general > deploys\] Ann: while you were away/);
     assert.match(generalText, /\[T id=5\] \[#general > deploys\] Ann \(mention\): @bot are you back\?/);
+    assert.match(generalText, /\[T id=6\] \[#general > release\] Ann: shipping now/);
     assert.ok(general.tags!.includes('zulip:missed'));
     assert.ok(general.tags!.includes('chat:mention'));
 
@@ -788,8 +855,17 @@ test('the reconnect sweep delivers what arrived while offline, by what the host 
     assert.match(devText, /count="1" lines="15" reason="mention"/, 'closed channel: the mention plus ±7 vicinity');
     assert.doesNotMatch(devText, /dev 51\b/, 'far ambient is not replayed');
 
-    assert.equal(second.server.delivery.watermark('zulip:general'), 5);
+    assert.equal(second.server.delivery.watermark('zulip:general'), 6);
     assert.equal(second.server.delivery.watermark('zulip:dev'), 70, 'advanced past everything scanned');
+    // The agent answers the blocks through channels/publish: a backscroll's
+    // answer goes to its newest message's topic, a mention block's to its
+    // newest mention's, not the talk after it.
+    const topicOfAnswer = async (channelId: string) => {
+      await second.host.sendRequest(method.CHANNELS_PUBLISH, { conversationId: 'c1', channelId, content: [{ type: 'text', text: 'back now' }] });
+      return (second.adapter.published.at(-1)?.hints?.metadata as { topic?: string } | undefined)?.topic;
+    };
+    assert.equal(await topicOfAnswer('zulip:general'), 'release');
+    assert.equal(await topicOfAnswer('zulip:dev'), 'triage');
     await second.close();
 
     // Session 3: nothing new → nothing pushed, and the sweep runs once.

@@ -195,7 +195,7 @@ render `(edited)` and `(moved)` trailers with `metadata.editedAt` /
 
 | Channel id | What it is |
 |---|---|
-| `zulip:<stream>` | A stream. Topics are threads: incoming messages carry the topic as `threadId`; publishes go to the topic of the most recent incoming message, else `mcpl`. Streams visible at startup are registered then; one the bot joins later announces itself (see below). |
+| `zulip:<stream>` | A stream. Topics are threads: incoming messages carry the topic as `threadId`; publishes go to the topic of the newest message the host accepted there (delivered while the stream is open, or pushed as a mention or DM while it's closed), else `mcpl`. Streams visible at startup are registered then; one the bot joins later announces itself (see below). |
 | `zulip:dm:<ids>` | A DM conversation, keyed by the other parties' sorted user ids (`zulip:dm:42`, `zulip:dm:7+42`). Discovered from recent DM history and announced on the fly (`channels/changed`) when someone new writes. |
 
 Descriptors carry `capabilities.history` (`maxMessages`, `supportsBeforeMessage`,

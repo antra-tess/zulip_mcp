@@ -938,6 +938,9 @@ export class ZulipMcplServer {
       this.delivery.hold(channelId, id, 'queued');
       const delivered = await this.pushEvent(message, `zulip_msg_${message.messageId}`);
       if (delivered) {
+        // The agent's answer goes back through channels/publish, so it goes
+        // to this message's topic, as an answer on an open channel does.
+        this.channelManager.noteConversation(channelId, message);
         if (this.accepted(channelId, id)) this.delivery.save();
         void this.healUndelivered();
       } else {
@@ -1218,6 +1221,14 @@ export class ZulipMcplServer {
       // mention-only channel does not re-surface its non-mention tail; the
       // block covered every held id in the range, so their holds go too.
       this.delivery.advanceThrough(channelId, newestId);
+      // The agent answers the block through channels/publish too, so the
+      // conversation is where its newest message that addresses the agent
+      // is (in a backscroll, its newest message), as live pushes or an open
+      // channel's deliveries would have left it.
+      for (let i = msgs.length - 1; i >= 0; i--) {
+        if (!keepAll && !views[i].mentioned) continue;
+        if (this.channelManager.noteConversation(channelId, msgs[i])) break;
+      }
     }
     return ok;
   }

@@ -28,15 +28,16 @@ export type PublishResult = ChannelsPublishResult & { messageIds?: string[] };
 
 /**
  * Routing hints for outgoing messages, derived by the MCPL layer from the
- * most recent incoming message on the target channel. The host's
- * channels/publish carries no thread information, so "reply where the
- * conversation is" is reconstructed server-side: Zulip maps threadId to a
- * topic.
+ * newest message the host accepted on the target channel: delivered while it
+ * was open, or pushed as a mention or DM while it was closed
+ * (ChannelManager.noteConversation). The host's channels/publish carries no
+ * thread information, so "reply where the conversation is" is reconstructed
+ * server-side: Zulip maps threadId to a topic.
  */
 export interface RoutingHints {
-  /** threadId of the last incoming message on this channel, if any. */
+  /** threadId of that message, if any. */
   threadId?: string;
-  /** metadata of the last incoming message on this channel, if any. */
+  /** metadata of that message, if any. */
   metadata?: Record<string, unknown>;
 }
 
