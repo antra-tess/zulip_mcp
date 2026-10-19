@@ -1494,7 +1494,12 @@ test('live events received before the catch-up sweep are held, so a live deliver
 });
 
 test('gap recovery also catches up closed channels, paging through history up to the ceiling', async () => {
-  const h = harness({ history: Array.from({ length: 250 }, (_, i) => streamMsg(i + 2, { mentioned: i + 2 === 50 })) });
+  // Two mentions, an older one in "billing" and the newest in "triage",
+  // among talk in "deploys".
+  const mention = (id: number, topic: string) =>
+    streamMsg(id, { mentioned: true, threadId: topic, metadata: { topic, mentioned: true, isDM: false } });
+  const h = harness({ history: Array.from({ length: 250 }, (_, i) =>
+    i + 2 === 45 ? mention(45, 'billing') : i + 2 === 50 ? mention(50, 'triage') : streamMsg(i + 2)) });
   await initialize(h, true);
   await settled(h);
   h.adapter.pageCap = 30;
@@ -1506,10 +1511,35 @@ test('gap recovery also catches up closed channels, paging through history up to
   assert.deepEqual(calls.map((c) => c.query.afterMessageId), ['1', '31', '61', '91'], 'paged from the watermark, page by page');
   assert.deepEqual(calls.map((c) => c.query.limit), [100, 70, 40, 10], 'never over the ceiling in total');
   const block = (h.pushed[0].payload.content[0] as { text: string }).text;
-  assert.match(block, /count="1" lines="15" reason="mention" truncated="true"/);
+  assert.match(block, /count="2" lines="20" reason="mention" truncated="true"/);
   assert.match(block, /catch-up ceiling was reached.*after=101/);
+  await until(() => h.server.delivery.watermark('zulip:general') === 101, 'the block accepted');
   assert.equal(h.server.delivery.watermark('zulip:general'), 101, 'advanced through everything scanned');
   assert.equal((h.pushed[0].origin as { truncated?: boolean }).truncated, true);
+  // The agent answers the block in the topic of its newest mention.
+  await h.host.sendRequest(method.CHANNELS_PUBLISH, { conversationId: 'c1', channelId: 'zulip:general', content: [{ type: 'text', text: 'on it' }] });
+  assert.equal((h.adapter.published.at(-1)?.hints?.metadata as { topic?: string } | undefined)?.topic, 'triage');
+  await h.close();
+});
+
+test('a catch-up block the host refuses moves no topic', async () => {
+  const h = harness({ history: Array.from({ length: 20 }, (_, i) => i + 2 === 10
+    ? streamMsg(10, { mentioned: true, threadId: 'triage', metadata: { topic: 'triage', mentioned: true, isDM: false } })
+    : streamMsg(i + 2)) });
+  await initialize(h, true);
+  await settled(h);
+  h.server.delivery.advance('zulip:general', 1);
+  // The block goes out under the newest id it scanned, 21.
+  h.policy.rejectPushes.add('21');
+
+  h.adapter.systemEvent!({ kind: 'gap', text: 'Queue expired.', metadata: { platform: 'zulip' } });
+  await until(() => h.pushed.length === 1, 'catch-up push for the closed channel');
+  assert.equal((h.pushed[0].origin as { messageId?: string }).messageId, '21');
+  // A round trip after the refusal: the server has handled it by the answer.
+  await h.host.sendRequest(method.CHANNELS_LIST);
+  assert.equal(h.server.delivery.watermark('zulip:general'), 1, 'refused: the watermark stays');
+  await h.host.sendRequest(method.CHANNELS_PUBLISH, { conversationId: 'c1', channelId: 'zulip:general', content: [{ type: 'text', text: 'on it' }] });
+  assert.equal((h.adapter.published.at(-1)?.hints?.metadata as { topic?: string } | undefined)?.topic, undefined);
   await h.close();
 });
 
