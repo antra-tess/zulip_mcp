@@ -4,8 +4,9 @@
  * Channel ids:
  *   zulip:{stream_name}      a stream; threads map to topics (incoming carries
  *                            the topic as threadId; publishes route to the
- *                            topic of the newest message the host accepted
- *                            there, else 'mcpl')
+ *                            topic of the newest message
+ *                            ChannelManager.noteConversation took there,
+ *                            else 'mcpl')
  *   zulip:dm:{ids}           a direct-message conversation, keyed by the
  *                            other parties' sorted user ids (see history.ts)
  *
@@ -560,9 +561,9 @@ export class ZulipAdapter implements PlatformAdapter {
       what = `direct message to ${channelId}`;
     } else {
       const streamName = streamNameOf(channelId);
-      // Route to the topic of the newest message the host accepted on this
-      // channel (in-thread answers); fall back to the 'mcpl' topic when the
-      // agent initiates the conversation.
+      // Route to the topic of the newest message noteConversation took on
+      // this channel (in-thread answers); fall back to the 'mcpl' topic when
+      // the agent initiates the conversation.
       const topic =
         (typeof hints?.metadata?.topic === 'string' ? hints.metadata.topic : undefined) ??
         hints?.threadId ??
@@ -657,10 +658,9 @@ export class ZulipAdapter implements PlatformAdapter {
    * Best-effort typing indicator.
    *
    * Stream typing goes to `metadata.topic`. ChannelManager.sendTyping fills
-   * it in when the host names none (the topic of the newest message the host
-   * accepted)
-   * and stops a run in the topic it started in; falls back to 'mcpl' only
-   * when there is still no topic.
+   * it in when the host names none (the topic of the newest message
+   * noteConversation took) and stops a run in the topic it started in;
+   * falls back to 'mcpl' only when there is still no topic.
    *
    * `op` is passed through: 'start' while the host refreshes (every ~7s
    * during inference), 'stop' when the turn ends. Zulip expires a start that

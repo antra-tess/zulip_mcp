@@ -101,10 +101,10 @@ export class ChannelManager {
   private batchTimer: ReturnType<typeof setTimeout> | null = null;
   private batchWindowMs: number;
   private flushing: Promise<void> | null = null;
-  /** Per-channel routing hints from the newest message the host accepted
-   *  (noteConversation), so publishes can land in the active thread/topic,
-   *  with the id of the message they came from, so an older message
-   *  delivered late doesn't move them back. */
+  /** Per-channel routing hints from the newest message noteConversation
+   *  took, so publishes can land in the active thread/topic, with the id of
+   *  the message they came from, so an older message delivered late doesn't
+   *  move them back. */
   private lastIncoming = new Map<string, { hints: RoutingHints; from?: number }>();
   /** Per-channel topic the current typing run started in, so a refresh that
    *  moves to a newer topic, and the final stop, cancel it there. */
@@ -483,16 +483,21 @@ export class ChannelManager {
   }
 
   /**
-   * Remember where the conversation is, so publishes reply in-thread: from a
-   * message delivered on an open channel, and from a mention or DM the host
-   * accepted as a push while the channel is closed, alone or in a catch-up
-   * block, since the agent answers those through channels/publish too. The
-   * newest message wins: one older than the message the hints came from (a
-   * push accepted after a newer one's, a held message offered again) leaves
-   * them where they are. A marker about a message (a reaction, an edit, a
-   * move, a deletion) is not the conversation: a moderator moving a
-   * month-old message to `archive` must not retarget the reply the agent is
-   * composing in `support`. Returns whether the hints moved.
+   * Remember where the conversation is, so publishes reply in-thread. The
+   * agent answers what reaches it through channels/publish, so the hints come
+   * from the newest of these on the channel: a message queued for the host
+   * while the channel is open, as it's queued (so one the batch then
+   * withholds, or the host refuses, moves them too); a mention or DM the host
+   * accepted as a push while the channel is closed; a catch-up block the host
+   * accepted, from its newest mention, or in a backscroll block its newest
+   * message; and the newest message of the history channels/open returned,
+   * unless it was fetched before a given message. The newest message wins:
+   * one older than the message the hints came from (a push accepted after a
+   * newer one's, a held message offered again) leaves them where they are. A
+   * marker about a message (a reaction, an edit, a move, a deletion) is not
+   * the conversation: a moderator moving a month-old message to `archive`
+   * must not retarget the reply the agent is composing in `support`. Returns
+   * whether the hints moved.
    */
   noteConversation(channelId: string, message: IncomingChannelMessage): boolean {
     const meta = isRecord(message.metadata) ? message.metadata : undefined;
@@ -574,8 +579,8 @@ export class ChannelManager {
     if (!adapter?.sendTyping) return;
     const descriptor = this.allChannels.get(channelId);
     // A topic the host names wins. Like publish, a host that names none means
-    // the conversation's current one, the topic of the newest message the
-    // host accepted (noteConversation).
+    // the conversation's current one, the topic of the newest message
+    // noteConversation took.
     // The host may send refreshes and the stop with the channel alone, so a run
     // that a newer message moved must be stopped where it started, or it
     // lingers there.
