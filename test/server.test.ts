@@ -85,8 +85,9 @@ function fakeAdapter(withTyping = true): FakeAdapter {
     async fetchHistory(channelId, query): Promise<ChannelHistoryPage> {
       adapter.historyCalls.push({ channelId, query });
       let rows = adapter.history.filter((m) => m.channelId === channelId);
+      // As history.ts does: the after-cursor wins when both are given.
       if (query.afterMessageId !== undefined) rows = rows.filter((m) => Number(m.messageId) > Number(query.afterMessageId));
-      if (query.beforeMessageId !== undefined) rows = rows.filter((m) => Number(m.messageId) < Number(query.beforeMessageId));
+      else if (query.beforeMessageId !== undefined) rows = rows.filter((m) => Number(m.messageId) < Number(query.beforeMessageId));
       const limit = Math.min(query.limit, adapter.pageCap);
       const page = query.afterMessageId !== undefined ? rows.slice(0, limit) : rows.slice(-limit);
       const newest = page[page.length - 1];
@@ -744,6 +745,58 @@ test('an answer in a closed stream goes to the topic of the mention the host acc
   await g.close();
 });
 
+test('an answer after channels/open with history goes to the topic of its newest message, unless the history was fetched before a message', async () => {
+  const answerTopic = async (h: Harness) => {
+    await h.host.sendRequest(method.CHANNELS_PUBLISH, { conversationId: 'c1', channelId: 'zulip:general', content: [{ type: 'text', text: 'answer' }] });
+    return (h.adapter.published.at(-1)?.hints?.metadata as { topic?: string } | undefined)?.topic;
+  };
+  const inTopic = (id: number, topic: string) => streamMsg(id, { threadId: topic, metadata: { topic, mentioned: false, isDM: false } });
+  const history = [inTopic(1, 'deploys'), inTopic(2, 'printer')];
+
+  // A stream never open in this process: the agent opens it, reads its
+  // backscroll and answers, and typing with no topic from the host follows.
+  const h = harness({ history });
+  await initialize(h, true);
+  await settled(h);
+  await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {}, history: { limit: 20 } });
+  await h.host.sendRequest(method.CHANNELS_TYPING, { channelId: 'zulip:general', op: 'start' });
+  await until(() => h.adapter.typing.length === 1, 'typing start');
+  assert.equal(h.adapter.typing[0].metadata?.topic, 'printer');
+  assert.equal(await answerTopic(h), 'printer');
+  await h.close();
+
+  // History fetched before a given message is older history, read for
+  // context, so it moves nothing, and the answer has no topic from it. With
+  // no watermark yet, sinceLastSeen has nothing to read forward from, so the
+  // page is fetched before the message.
+  const g = harness({ history });
+  await initialize(g, true);
+  await settled(g);
+  await g.host.sendRequest(method.CHANNELS_OPEN, {
+    channelId: 'zulip:general', type: 'zulip', address: {}, history: { limit: 20, beforeMessageId: '3', sinceLastSeen: true },
+  });
+  const anchored = g.adapter.historyCalls.at(-1)!.query;
+  assert.equal(anchored.beforeMessageId, '3');
+  assert.equal(anchored.afterMessageId, undefined);
+  assert.equal(await answerTopic(g), undefined);
+  await g.close();
+
+  // A mention pushed while the stream is closed keeps its topic through an
+  // open without history, as a host opens a stream to deliver an answer,
+  // and through an open whose history is older than the mention.
+  const k = harness({ history });
+  await initialize(k, true);
+  await settled(k);
+  k.adapter.emit!(streamMsg(10, { mentioned: true, threadId: 'billing', metadata: { topic: 'billing', mentioned: true, isDM: false } }));
+  await until(() => k.server.delivery.watermark('zulip:general') === 10, 'the mention accepted');
+  await k.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+  assert.equal(await answerTopic(k), 'billing');
+  await k.host.sendRequest(method.CHANNELS_CLOSE, { channelId: 'zulip:general' });
+  await k.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {}, history: { limit: 20 } });
+  assert.equal(await answerTopic(k), 'billing');
+  await k.close();
+});
+
 test('ZULIP_ATTRIBUTE_DELIVERY=false delivers bare bodies on every attributed surface: incoming, recovered replay, push', async () => {
   const h = harness({ attributeDelivery: false, history: [streamMsg(1), streamMsg(2), streamMsg(3)] });
   await initialize(h, true);
@@ -802,6 +855,19 @@ test('channels/open returns capped history before the lifecycle commits, and sub
   assert.deepEqual(since.history!.map((m) => m.messageId), ['13', '14']);
   const lastCall = h.adapter.historyCalls[h.adapter.historyCalls.length - 1];
   assert.equal(lastCall.query.afterMessageId, '12');
+
+  // sinceLastSeen wins over a message to page back from, so the page is new
+  // history, and its newest message gives the answer's topic.
+  h.adapter.history.push(streamMsg(15, { threadId: 'printer', metadata: { topic: 'printer', mentioned: false, isDM: false } }));
+  const both = (await h.host.sendRequest(method.CHANNELS_OPEN, {
+    channelId: 'zulip:general', type: 'zulip', address: {}, history: { limit: 50, sinceLastSeen: true, beforeMessageId: '13' },
+  })) as { history?: IncomingChannelMessage[] };
+  assert.deepEqual(both.history!.map((m) => m.messageId), ['15']);
+  const bothCall = h.adapter.historyCalls.at(-1)!;
+  assert.equal(bothCall.query.afterMessageId, '14');
+  assert.equal(bothCall.query.beforeMessageId, undefined);
+  await h.host.sendRequest(method.CHANNELS_PUBLISH, { conversationId: 'c1', channelId: 'zulip:general', content: [{ type: 'text', text: 'answer' }] });
+  assert.equal((h.adapter.published.at(-1)?.hints?.metadata as { topic?: string } | undefined)?.topic, 'printer');
   await h.close();
 });
 
