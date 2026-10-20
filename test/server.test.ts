@@ -1528,18 +1528,21 @@ test('a catch-up block the host refuses moves no topic', async () => {
     : streamMsg(i + 2)) });
   await initialize(h, true);
   await settled(h);
-  h.server.delivery.advance('zulip:general', 1);
+  // The last mention the agent was given is in "support", and older than the
+  // block's, so a refused block that took or cleared the hint would show.
+  h.adapter.emit!(streamMsg(1, { mentioned: true, threadId: 'support', metadata: { topic: 'support', mentioned: true, isDM: false } }));
+  await until(() => h.server.delivery.watermark('zulip:general') === 1, 'the mention in support accepted');
   // The block goes out under the newest id it scanned, 21.
   h.policy.rejectPushes.add('21');
 
   h.adapter.systemEvent!({ kind: 'gap', text: 'Queue expired.', metadata: { platform: 'zulip' } });
-  await until(() => h.pushed.length === 1, 'catch-up push for the closed channel');
-  assert.equal((h.pushed[0].origin as { messageId?: string }).messageId, '21');
+  await until(() => h.pushed.length === 2, 'catch-up push for the closed channel');
+  assert.equal((h.pushed[1].origin as { messageId?: string }).messageId, '21');
   // A round trip after the refusal: the server has handled it by the answer.
   await h.host.sendRequest(method.CHANNELS_LIST);
   assert.equal(h.server.delivery.watermark('zulip:general'), 1, 'refused: the watermark stays');
   await h.host.sendRequest(method.CHANNELS_PUBLISH, { conversationId: 'c1', channelId: 'zulip:general', content: [{ type: 'text', text: 'on it' }] });
-  assert.equal((h.adapter.published.at(-1)?.hints?.metadata as { topic?: string } | undefined)?.topic, undefined);
+  assert.equal((h.adapter.published.at(-1)?.hints?.metadata as { topic?: string } | undefined)?.topic, 'support');
   await h.close();
 });
 
