@@ -1,21 +1,12 @@
-/**
- * Content helpers — Zulip message formatting and attachment handling.
- *
- * Pure functions shared by the MCP tool layer (index.ts) and the Zulip
- * adapter (src/platforms/zulip.ts). Kept free of client/SDK dependencies so both
- * sides can import without cycles.
- */
-
 import { realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
 /**
- * Run-as-main detection that survives npm bin symlinks. Node resolves the
- * entry module to its realpath while process.argv[1] keeps the symlink path,
- * so a naive `import.meta.url === pathToFileURL(argv[1]).href` is false when
- * launched via `npx`/a bin shim. Both sides are canonicalised: argv[1] for
- * the bin shim, and the entry path because it can itself sit behind a
- * symlinked directory (macOS's /var → /private/var, --preserve-symlinks).
+ * Node resolves the entry module to its realpath while process.argv[1] keeps
+ * the symlink path, so a naive `import.meta.url === pathToFileURL(argv[1]).href`
+ * is false when launched via `npx`/a bin shim. Both sides are canonicalised:
+ * argv[1] for the bin shim, and the entry path because it can itself sit
+ * behind a symlinked directory (macOS's /var → /private/var, --preserve-symlinks).
  */
 export function isMainModule(importMetaUrl: string, argv1: string | undefined): boolean {
   if (!argv1) return false;
@@ -30,8 +21,6 @@ export function isMainModule(importMetaUrl: string, argv1: string | undefined): 
 // so an over-eager fetch can't poison the agent's next turn.
 export const MAX_ATTACHMENT_BYTES = 5 * 1024 * 1024;
 
-// MIME types we decode and return as `content_text` instead of base64,
-// so the agent can read them directly (CSVs, JSON, plain text, etc).
 const TEXT_MIME_RE = /^(text\/|application\/(json|xml|x-yaml|yaml|csv|x-www-form-urlencoded)\b)/i;
 
 export interface FetchedAttachment {
@@ -40,11 +29,6 @@ export interface FetchedAttachment {
   name: string;
 }
 
-/**
- * Authenticated GET with an enforced size cap. Checks Content-Length when the
- * server provides one, and streams with a running byte budget as defense in
- * depth so a missing or lying header can't OOM the process.
- */
 export async function fetchAttachmentBytes(
   url: string,
   fallbackName: string,
@@ -53,7 +37,6 @@ export async function fetchAttachmentBytes(
   const resp = await fetch(url, { headers: opts.headers ?? {}, redirect: "follow" });
   if (!resp.ok) throw new Error(`fetch failed: ${resp.status} ${resp.statusText}`);
 
-  // Pre-check Content-Length so an oversized declared body never starts buffering.
   const declared = resp.headers.get("content-length");
   if (declared !== null) {
     const n = Number(declared);
@@ -65,7 +48,6 @@ export async function fetchAttachmentBytes(
   const reader = resp.body?.getReader();
   let buf: Buffer;
   if (!reader) {
-    // No streaming body: fall back to arrayBuffer with a post-read check.
     buf = Buffer.from(await resp.arrayBuffer());
     if (buf.byteLength > MAX_ATTACHMENT_BYTES) {
       throw new Error(`attachment too large: ${buf.byteLength} bytes (max ${MAX_ATTACHMENT_BYTES})`);
@@ -93,11 +75,6 @@ export async function fetchAttachmentBytes(
   return { buf, mimeType, name: fallbackName };
 }
 
-/**
- * Shape a successful fetch into the tool's response. Images return as native
- * MCP content blocks (via `_content`), text-ish MIME types return decoded
- * `content_text`, other binary returns `base64`.
- */
 export function toFetchResult({ buf, mimeType, name }: FetchedAttachment): Record<string, unknown> {
   if (mimeType.startsWith("image/")) {
     return {
@@ -125,16 +102,11 @@ export function toFetchResult({ buf, mimeType, name }: FetchedAttachment): Recor
 }
 
 /**
- * Validate a Zulip attachment path or URL against the configured realm before
- * the bot's credentials are attached. Tool input is influenced by message
- * content from untrusted senders, so only `/user_uploads/` on the realm host
- * may be reachable.
- *
- * SAFETY INVARIANT: the prefix check relies on `new URL()` normalizing dot
- * segments BEFORE `pathname` is read — '/user_uploads/../api/v1/users/me'
- * (and its percent-encoded variants; the WHATWG parser treats '%2e%2e' as
- * '..') normalizes to '/api/v1/users/me' and is rejected. Never replace this
- * with a check on the raw input string.
+ * The prefix check relies on `new URL()` normalizing dot segments before
+ * `pathname` is read: '/user_uploads/../api/v1/users/me' (and its
+ * percent-encoded variants; the WHATWG parser treats '%2e%2e' as '..')
+ * normalizes to '/api/v1/users/me' and is rejected. Never replace this with a
+ * check on the raw input string.
  */
 export function parseZulipAttachmentUrl(rawPath: string, zulipRealm: string): URL {
   if (!rawPath) throw new Error("path is required");
@@ -162,9 +134,9 @@ export function parseZulipAttachmentUrl(rawPath: string, zulipRealm: string): UR
 }
 
 export interface AttachmentRef {
-  path: string;       // e.g. "/user_uploads/2/Ab/cd/screenshot.png"
-  name: string;       // basename for human display
-  mimeType: string;   // best-effort from extension
+  path: string;
+  name: string;
+  mimeType: string;
   isImage: boolean;
 }
 
@@ -192,8 +164,7 @@ export function classifyExtension(name: string): { mimeType: string; isImage: bo
 }
 
 // Zulip uploads appear in markdown as `[name](/user_uploads/X/Yy/Zz/name.ext)`
-// or inline-image syntax `![name](/user_uploads/...)`. We pull paths out so the
-// agent can request the bytes on demand via fetch_attachment.
+// or inline-image syntax `![name](/user_uploads/...)`.
 export function extractZulipAttachments(rawContent: string): AttachmentRef[] {
   const refs: AttachmentRef[] = [];
   const seen = new Set<string>();
@@ -210,33 +181,24 @@ export function extractZulipAttachments(rawContent: string): AttachmentRef[] {
   return refs;
 }
 
-// Helper function to strip HTML and format content with mention handling.
-// Only for paths where Zulip returns rendered HTML: today that is
-// `formatMessages` in tool-runtime.ts, fed by `messages.retrieve` without
-// `apply_markdown:false`. Everything that goes through `normalizeMessage`
-// (history, fetch_around, DM discovery, the live event queue) is raw markdown
-// and uses `cleanMarkdown` instead; running this strip on raw markdown deletes
-// author-typed XML/HTML (#24). Attachment refs on the raw path are extracted
-// by extractZulipAttachments.
+// Only for paths where Zulip returns rendered HTML (fetched without
+// `apply_markdown:false`): on raw markdown this strip deletes author-typed
+// XML/HTML (#24).
 export function cleanContent(html: string): string {
   let content = html;
 
-  // Extract Zulip mentions first
   content = content.replace(
     /<span class="user-mention"[^>]*data-user-id="(\d+)"[^>]*>@([^<]+)<\/span>/g,
     '@$2 (uid:$1)'
   );
 
-  // Handle silent mentions
   content = content.replace(
     /<span class="user-mention silent"[^>]*data-user-id="(\d+)"[^>]*>([^<]+)<\/span>/g,
     '$2 (uid:$1)'
   );
 
-  // Preserve attachment / inline-image URLs before the generic tag strip below
-  // eats them. Zulip renders uploads as `<a href="/user_uploads/...">name</a>`
-  // and inline images as the same anchor wrapping an `<img>`. Without this,
-  // history fetches lose the URL and the agent can't call fetch_attachment.
+  // Zulip renders uploads as `<a href="/user_uploads/...">name</a>` and inline
+  // images as the same anchor wrapping an `<img>`.
   content = content.replace(
     /<a [^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/g,
     (_match, href: string, inner: string) => {
@@ -246,9 +208,6 @@ export function cleanContent(html: string): string {
         if (hasImg) return `[image: ${href}]`;
         return text ? `[attachment: ${text} — ${href}]` : `[attachment: ${href}]`;
       }
-      // External anchors with an inline image preview: keep `[image: ...]` so
-      // the agent can choose to fetch. Plain external links keep the prior
-      // text-only behaviour (no scope creep on non-attachment links).
       if (hasImg) return `[image: ${href}]`;
       return text || href;
     }
@@ -260,7 +219,6 @@ export function cleanContent(html: string): string {
     '[image: $1]'
   );
 
-  // Clean up HTML
   content = content
     .replace(/<p>/gi, '\n')
     .replace(/<br\s*\/?>/gi, '\n')
@@ -275,13 +233,9 @@ export function cleanContent(html: string): string {
 }
 
 /**
- * Normalise raw markdown as returned by Zulip with `apply_markdown: false`.
- * Deliberately NOT an HTML stripper: raw markdown contains no HTML of Zulip's
- * making, so any `<...>` in it is the author's own text (XML in a fenced
- * block, generics such as `Map<string, T>`, comparisons). Running
- * `cleanContent()` on this path deleted all of it (#24). Mentions are already
- * textual (`@**Name**`) and uploads are `[name](/user_uploads/...)`, so the
- * only work left is line-ending and whitespace normalisation.
+ * Not an HTML stripper: raw markdown (`apply_markdown: false`) contains no
+ * HTML of Zulip's making, so any `<...>` in it is the author's own text (XML
+ * in a fenced block, generics such as `Map<string, T>`, comparisons) (#24).
  */
 export function cleanMarkdown(raw: string): string {
   return raw.replace(/\r\n?/g, '\n').trim();
@@ -290,11 +244,6 @@ export function cleanMarkdown(raw: string): string {
 /** Zulip's default `max_message_length` realm setting. */
 export const ZULIP_MAX_MESSAGE_LENGTH = 10000;
 
-/**
- * Split text into messages of at most `limit` characters, preferring
- * paragraph boundaries, then line boundaries, then a hard cut. Boundary
- * whitespace at the split is dropped; nothing else is.
- */
 export function chunkMessage(text: string, limit: number = ZULIP_MAX_MESSAGE_LENGTH): string[] {
   const out: string[] = [];
   let rest = text;
