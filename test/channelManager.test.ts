@@ -173,6 +173,30 @@ test('a newer message in another topic stops typing where it started before star
   manager.destroy();
 });
 
+test('the newest message sets the topic: one older than the message it came from, delivered or pushed late, leaves it', async () => {
+  const { manager, typed } = makeTypingManager();
+  await manager.registerChannels();
+  manager.openChannel({ type: 'zulip' });
+  const at = (id: number, topic: string) => zulipMessage('zulip:support', { id, subject: topic });
+  manager.onIncomingMessage('zulip:support', at(50, 'router B'));
+  // A held message offered again, older than the one the topic came from.
+  manager.onIncomingMessage('zulip:support', at(42, 'router A'));
+  await manager.sendTyping('zulip:support');
+  // A pushed mention accepted after a newer one's, as noteConversation hears of it.
+  assert.equal(manager.noteConversation('zulip:support', at(45, 'router C')), false, 'older: the topic stays');
+  await manager.sendTyping('zulip:support');
+  assert.equal(manager.noteConversation('zulip:support', at(51, 'router D')), true, 'newer: it moves');
+  await manager.sendTyping('zulip:support');
+  await manager.sendTyping('zulip:support', undefined, 'stop');
+  assert.deepEqual(typedOps(typed), [['router B', 'start'], ['router B', 'start'], ['router B', 'stop'], ['router D', 'start'], ['router D', 'stop']]);
+  // A new connection starts from no topic, so an older message held from before it sets one.
+  manager.reset();
+  await manager.registerChannels();
+  manager.openChannel({ type: 'zulip' });
+  assert.equal(manager.noteConversation('zulip:support', at(44, 'router E')), true);
+  manager.destroy();
+});
+
 test('a reaction or change marker does not retarget typing', async () => {
   const { manager, typed } = makeTypingManager();
   await manager.registerChannels();

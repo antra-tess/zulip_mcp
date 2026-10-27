@@ -694,18 +694,27 @@ export class ZulipMcplServer {
       const cap = Math.min(HISTORY_ON_OPEN_CAP, historyCapOf(descriptor));
       const limit = Math.min(requested, cap);
       const watermark = this.delivery.watermark(descriptor.id);
-      const page = await this.adapter.fetchHistory(descriptor.id, {
-        limit,
-        beforeMessageId: params.history?.beforeMessageId,
-        afterMessageId:
-          params.history?.sinceLastSeen && watermark !== undefined ? String(watermark) : undefined,
-      });
+      // Since the last seen message wins: a request that also names a
+      // message to page back from reads forward from the watermark.
+      const afterMessageId =
+        params.history?.sinceLastSeen && watermark !== undefined ? String(watermark) : undefined;
+      const beforeMessageId = afterMessageId === undefined ? params.history?.beforeMessageId : undefined;
+      const page = await this.adapter.fetchHistory(descriptor.id, { limit, beforeMessageId, afterMessageId });
       // Not attributed: the host hands this back as the channel_open tool
       // result, JSON that already shows author, threadId and metadata.
       result.history = this.projectHistoryReactions(page.messages);
       result.historyTruncated = requested > limit;
       // Handed to the host in this very response: forwarded.
       for (const m of page.messages) this.accepted(descriptor.id, Number(m.messageId));
+      // This history goes to the agent, which answers it through
+      // channels/publish, so its newest message gives the topic. A page
+      // fetched before a given message is older history, read for context,
+      // and moves nothing.
+      if (beforeMessageId === undefined) {
+        for (let i = page.messages.length - 1; i >= 0; i--) {
+          if (this.channelManager.noteConversation(descriptor.id, page.messages[i])) break;
+        }
+      }
     }
 
     this.channelManager.markOpen(descriptor.id);
@@ -938,6 +947,9 @@ export class ZulipMcplServer {
       this.delivery.hold(channelId, id, 'queued');
       const delivered = await this.pushEvent(message, `zulip_msg_${message.messageId}`);
       if (delivered) {
+        // The agent's answer goes back through channels/publish, so it goes
+        // to this message's topic, as an answer on an open channel does.
+        this.channelManager.noteConversation(channelId, message);
         if (this.accepted(channelId, id)) this.delivery.save();
         void this.healUndelivered();
       } else {
@@ -1218,6 +1230,14 @@ export class ZulipMcplServer {
       // mention-only channel does not re-surface its non-mention tail; the
       // block covered every held id in the range, so their holds go too.
       this.delivery.advanceThrough(channelId, newestId);
+      // The agent answers the block through channels/publish too, so the
+      // conversation is where its newest message that addresses the agent
+      // is (in a backscroll, its newest message), as live pushes or an open
+      // channel's deliveries would have left it.
+      for (let i = msgs.length - 1; i >= 0; i--) {
+        if (!keepAll && !views[i].mentioned) continue;
+        if (this.channelManager.noteConversation(channelId, msgs[i])) break;
+      }
     }
     return ok;
   }
