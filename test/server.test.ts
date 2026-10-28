@@ -30,7 +30,7 @@ import { join } from 'node:path';
 import type { ChannelHistoryPage, ChannelHistoryQuery, MessageChangeEvent, OnIncomingMessage, OnMessageChange, OnReaction, OnSystemEvent, PlatformAdapter, RoutingHints } from '../src/platforms/adapter.ts';
 import { ZulipMcplServer, type ZulipMcplServerOptions } from '../src/server.ts';
 import { FiltersPlane } from '../src/filters.ts';
-import type { ZulipToolRuntime } from '../src/tool-runtime.ts';
+import { ZulipToolRuntime } from '../src/tool-runtime.ts';
 import { toolDefinitions } from '../src/tools.ts';
 import { TOOL_CLASSES } from '../src/tool-classes.ts';
 
@@ -168,6 +168,7 @@ interface Harness {
 }
 
 interface HarnessOptions {
+  tools?: ZulipToolRuntime;
   mcpl?: boolean;
   typing?: boolean;
   stateDir?: string;
@@ -190,7 +191,7 @@ function harness(opts: HarnessOptions = {}): Harness {
 
   const adapter = opts.reuse?.adapter ?? fakeAdapter(opts.typing ?? true);
   if (opts.history) adapter.history = opts.history;
-  const server = opts.reuse?.server ?? new ZulipMcplServer(adapter, fakeTools as unknown as ZulipToolRuntime, {
+  const server = opts.reuse?.server ?? new ZulipMcplServer(adapter, opts.tools ?? fakeTools as unknown as ZulipToolRuntime, {
     serverInfo: { name: 'zulip-mcp-test', version: '0.0.0' },
     mcplEnabled: opts.mcpl ?? true,
     batchWindowMs: opts.batchWindowMs ?? 5,
@@ -336,6 +337,28 @@ async function awaitRegistered(h: Harness, andLive = true): Promise<void> {
 }
 
 // --- plain MCP ---------------------------------------------------------------
+
+test('edit_message reports unsupported parameters as a tool error on the wire', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'zulip-edit-wire-'));
+  const response = { result: 'success', msg: '', ignored_parameters_unsupported: ['content'] };
+  t.mock.method(globalThis, 'fetch', async () => new Response(JSON.stringify(response)));
+  const tools = new ZulipToolRuntime({
+    client: { messages: { async update() { return response; } } },
+    realm: 'https://z.example.com', authHeader: 'Basic test', selfUserId: 1, sessionId: 'test',
+  }, dir);
+  const h = harness({ tools });
+  try {
+    await initialize(h, false);
+    const result = await h.host.sendRequest('tools/call', {
+      name: 'edit_message', arguments: { message_id: 42, content: 'updated' },
+    }) as { isError?: boolean; content: { text: string }[] };
+    assert.equal(result.isError, true);
+    assert.match(result.content[0].text, /editing message 42.*ignored_parameters_unsupported.*content/);
+  } finally {
+    await h.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
 
 test('a plain-MCP client gets tools and resources, and no MCPL manifest', async () => {
   const h = harness();
