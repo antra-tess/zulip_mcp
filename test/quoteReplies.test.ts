@@ -171,3 +171,52 @@ test('an existing mention needs no quote lookup and retains its addressing', { t
   assert.ok(messages[0].tags?.includes('chat:mention'));
   assert.equal(gets, 0);
 });
+
+test('a hung quote lookup delays an unrelated message by at most the three-second budget', { timeout: 5000 }, async () => {
+  let release!: (value: unknown) => void;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const started = performance.now();
+  const receiving = receive([raw(300, quote()), raw(301, 'unrelated')], () => new Promise((resolve) => { release = resolve; }));
+  try {
+    const messages = await Promise.race([
+      receiving,
+      new Promise<never>((_, reject) => {
+        // Allow scheduler overhead beyond the dedicated three-second budget.
+        timer = setTimeout(() => reject(new Error('unrelated message blocked beyond quote budget')), 3500);
+      }),
+    ]);
+    assert.deepEqual(messages.map((m) => m.messageId), ['300', '301']);
+    assert.equal(messages[0].metadata?.mentioned, false);
+    assert.ok(performance.now() - started < 3500);
+  } finally {
+    if (timer) clearTimeout(timer);
+    release({ result: 'error', msg: 'unavailable' });
+    await receiving;
+  }
+});
+
+test('many quote headings look up only the first two distinct ids', { timeout: 2000 }, async () => {
+  const calls: number[] = [];
+  const content = [201, 201, 202, 203, QUOTED, 204].map((id) => quote(id)).join('\n');
+  const messages = await receive([raw(300, content)], async (params) => {
+    const id = Number(params.message_id);
+    calls.push(id);
+    return { result: 'success', message: raw(id, 'original', { sender_id: id === QUOTED ? SELF : 101 }) };
+  });
+  assert.deepEqual(calls, [201, 202]);
+  assert.equal(messages[0].metadata?.mentioned, false, 'later targets deliberately do not affect addressing');
+});
+
+test('translated quote heading link text is recognized', { timeout: 2000 }, async () => {
+  const messages = await receive([raw(300, quote().replace('[said]', '[dijo]'))], async () => ({
+    result: 'success', message: raw(QUOTED, 'original', { sender_id: SELF }),
+  }));
+  assert.equal(messages[0].metadata?.mentioned, true);
+});
+
+test('tilde quote fences are recognized', { timeout: 2000 }, async () => {
+  const messages = await receive([raw(300, quote().replaceAll('```', '~~~'))], async () => ({
+    result: 'success', message: raw(QUOTED, 'original', { sender_id: SELF }),
+  }));
+  assert.equal(messages[0].metadata?.mentioned, true);
+});

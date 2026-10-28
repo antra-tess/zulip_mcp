@@ -88,8 +88,8 @@ function addressOf(descriptor: ChannelDescriptor | undefined): Partial<ZulipChan
   return typeof address === 'object' && address !== null ? (address as Partial<ZulipChannelAddress>) : {};
 }
 
-/** Only a said link immediately heading a quote fence is a reply target.
- *  Ignore examples inside other fences and deduplicate repeated quotes. */
+/** Only a link immediately heading a quote fence is a reply target.
+ *  Ignore fenced examples; keep only the first two distinct targets. */
 function quotedMessageIds(content: string): Set<number> {
   const ids = new Set<number>();
   let pending: number | null = null;
@@ -101,13 +101,14 @@ function quotedMessageIds(content: string): Set<number> {
       continue;
     }
     if (marker) {
-      if (pending !== null && marker[1][0] === '`' && marker[2].trim() === 'quote') ids.add(pending);
+      if (pending !== null && marker[2].trim() === 'quote') ids.add(pending);
+      if (ids.size === 2) return ids;
       fence = marker[1];
       pending = null;
       continue;
     }
     if (!line.trim()) continue;
-    const header = /^(?:@_\*\*[^\r\n]*\*\* )?\[said\]\([^\s)]*\/near\/([1-9]\d*)\):[ \t]*$/.exec(line);
+    const header = /^(?:@_\*\*[^\r\n]*\*\* )?\[[^\]\n]*\]\([^\s)]*\/near\/([1-9]\d*)\):[ \t]*$/.exec(line);
     const id = header ? Number(header[1]) : NaN;
     pending = Number.isSafeInteger(id) ? id : null;
   }
@@ -130,6 +131,8 @@ interface SeenMessage {
 /** How long a GET placing a change may take before the change is dropped
  *  rather than wedging every change behind it. */
 const LOCATE_TIMEOUT_MS = 15_000;
+/** Total lookup budget for one incoming stream message's quote targets. */
+const QUOTE_TIMEOUT_MS = 3_000;
 /** How long the bot's own deletion is remembered so its echo is dropped. */
 const SELF_DELETE_TTL_MS = 10 * 60_000;
 const SELF_DELETE_CAP = 500;
@@ -358,14 +361,14 @@ export class ZulipAdapter implements PlatformAdapter {
   }
 
   /** Where a message lives — from the recent-messages cache, else one GET. */
-  private async locate(messageId: number, purpose = 'a reaction'): Promise<SeenMessage | null> {
+  private async locate(messageId: number, purpose = 'a reaction', timeoutMs = LOCATE_TIMEOUT_MS): Promise<SeenMessage | null> {
     const cached = this.seen.get(messageId);
     if (cached) return cached;
     try {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const result = await withTimeout<any>(
         this.zulipClient.messages.getById({ message_id: messageId, apply_markdown: false }),
-        LOCATE_TIMEOUT_MS,
+        timeoutMs,
         `GET message ${messageId}`,
       );
       assertApiSuccess(result, `message ${messageId}`);
@@ -382,11 +385,15 @@ export class ZulipAdapter implements PlatformAdapter {
   }
 
   /** Reuse the mention path, but never infer addressing from a silent mention.
-   *  locate prefers the author cache, then makes one bounded GET, failing closed. */
+   *  Check at most two distinct targets within a shared three-second budget;
+   *  prefer cached authors, otherwise one GET per target, failing closed. */
   private async markQuoteMention(m: ZulipMessage): Promise<void> {
     if (m.mentioned || this.identity.selfUserId === null) return;
+    const deadline = performance.now() + QUOTE_TIMEOUT_MS;
     for (const id of quotedMessageIds(m.rawContent)) {
-      const quoted = await this.locate(id, 'a quote reply');
+      const remaining = deadline - performance.now();
+      if (remaining <= 0) return;
+      const quoted = await this.locate(id, 'a quote reply', remaining);
       if (quoted?.authorId === this.identity.selfUserId) {
         m.mentioned = true;
         const cached = this.seen.get(m.id);
