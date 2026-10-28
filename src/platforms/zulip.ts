@@ -385,7 +385,9 @@ export class ZulipAdapter implements PlatformAdapter {
   }
 
   /** Reuse the mention path, but never infer addressing from a silent mention.
-   *  Check at most two distinct targets within a shared three-second budget;
+   *  Check at most the first two distinct targets per incoming message within
+   *  a shared three-second budget per message. Multiple quote replies in a poll
+   *  batch can delay later events by up to that budget for each message;
    *  prefer cached authors, otherwise one GET per target, failing closed. */
   private async markQuoteMention(m: ZulipMessage): Promise<void> {
     if (m.mentioned || this.identity.selfUserId === null) return;
