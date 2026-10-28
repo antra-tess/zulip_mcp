@@ -705,6 +705,7 @@ export class ZulipToolRuntime {
       }
 
       case "edit_message": {
+        if (typeof args.content !== "string") throw new Error("content is required");
         // zulip-js includes message_id in the query and sends no PATCH body.
         // Keep the id only in the path, with the exposed edit fields in the body.
         if (!this.session.realm || !this.session.authHeader) {
@@ -716,9 +717,23 @@ export class ZulipToolRuntime {
           headers: { Authorization: this.session.authHeader },
           body: new URLSearchParams({ content: args.content }),
         });
-        const result = await response.json();
+        const body = await response.text();
+        let result: any = null;
+        try {
+          result = JSON.parse(body);
+        } catch {
+          // Proxies can return HTML or an empty body; preserve the HTTP status.
+        }
+        if (!response.ok) {
+          let detail = typeof result?.msg === "string" ? result.msg : body;
+          const encodedAuth = this.session.authHeader.replace(/^Basic\s+/i, "");
+          const credentials = [this.session.authHeader, encodedAuth, ...Buffer.from(encodedAuth, "base64").toString().split(":")];
+          for (const credential of credentials.filter(Boolean)) detail = detail.replaceAll(credential, "[redacted]");
+          detail = detail.replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim().slice(0, 160);
+          throw new Error(`Zulip refused editing message ${args.message_id}: HTTP ${response.status}${detail ? `: ${detail}` : ""}`);
+        }
         assertApiSuccess(result, `editing message ${args.message_id}`);
-        if (!response.ok || result?.result !== "success") {
+        if (result?.result !== "success") {
           throw new Error(`Zulip refused editing message ${args.message_id}: HTTP ${response.status}`);
         }
         if (result.ignored_parameters_unsupported?.length) {
