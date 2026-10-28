@@ -705,11 +705,25 @@ export class ZulipToolRuntime {
       }
 
       case "edit_message": {
-        const result = await zulipClient.messages.update({
-          message_id: args.message_id,
-          content: args.content,
+        // zulip-js includes message_id in the query and sends no PATCH body.
+        // Keep the id only in the path, with the exposed edit fields in the body.
+        if (!this.session.realm || !this.session.authHeader) {
+          throw new Error("Cannot edit messages: realm or bot credentials are unknown");
+        }
+        const apiUrl = zulipClient.config?.apiURL ?? `${this.session.realm}/api/v1`;
+        const response = await fetch(`${apiUrl}/messages/${encodeURIComponent(args.message_id)}`, {
+          method: "PATCH",
+          headers: { Authorization: this.session.authHeader },
+          body: new URLSearchParams({ content: args.content }),
         });
+        const result = await response.json();
         assertApiSuccess(result, `editing message ${args.message_id}`);
+        if (!response.ok || result?.result !== "success") {
+          throw new Error(`Zulip refused editing message ${args.message_id}: HTTP ${response.status}`);
+        }
+        if (result.ignored_parameters_unsupported?.length) {
+          throw new Error(`Zulip refused editing message ${args.message_id}: ignored_parameters_unsupported: ${JSON.stringify(result.ignored_parameters_unsupported)}`);
+        }
         return result;
       }
 
