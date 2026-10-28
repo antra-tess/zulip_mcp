@@ -88,6 +88,33 @@ function addressOf(descriptor: ChannelDescriptor | undefined): Partial<ZulipChan
   return typeof address === 'object' && address !== null ? (address as Partial<ZulipChannelAddress>) : {};
 }
 
+/** Only a link immediately heading a quote fence is a reply target.
+ *  Ignore fenced examples; keep only the first two distinct targets. */
+function quotedMessageIds(content: string): Set<number> {
+  const ids = new Set<number>();
+  let pending: number | null = null;
+  let fence: string | null = null;
+  for (const line of content.split(/\r?\n/)) {
+    const marker = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(line);
+    if (fence !== null) {
+      if (marker && marker[1][0] === fence[0] && marker[1].length >= fence.length && !marker[2].trim()) fence = null;
+      continue;
+    }
+    if (marker) {
+      if (pending !== null && marker[2].trim() === 'quote') ids.add(pending);
+      if (ids.size === 2) return ids;
+      fence = marker[1];
+      pending = null;
+      continue;
+    }
+    if (!line.trim()) continue;
+    const header = /^(?:@_\*\*[^\r\n]*\*\* )?\[[^\]\n]*\]\([^\s)]*\/near\/([1-9]\d*)\):[ \t]*$/.exec(line);
+    const id = header ? Number(header[1]) : NaN;
+    pending = Number.isSafeInteger(id) ? id : null;
+  }
+  return ids;
+}
+
 /** A recently seen message, as the cache places reactions and changes. */
 interface SeenMessage {
   channelId: string;
@@ -97,13 +124,15 @@ interface SeenMessage {
   isDm: boolean;
   topic: string;
   snippet: string | null;
-  /** Zulip's mention verdict as the message last read. */
+  /** Mention verdict, including live quote replies to the bot's own messages. */
   mentioned: boolean;
 }
 
 /** How long a GET placing a change may take before the change is dropped
  *  rather than wedging every change behind it. */
 const LOCATE_TIMEOUT_MS = 15_000;
+/** Total lookup budget for one incoming stream message's quote targets. */
+const QUOTE_TIMEOUT_MS = 3_000;
 /** How long the bot's own deletion is remembered so its echo is dropped. */
 const SELF_DELETE_TTL_MS = 10 * 60_000;
 const SELF_DELETE_CAP = 500;
@@ -332,14 +361,14 @@ export class ZulipAdapter implements PlatformAdapter {
   }
 
   /** Where a message lives — from the recent-messages cache, else one GET. */
-  private async locate(messageId: number, purpose = 'a reaction'): Promise<SeenMessage | null> {
+  private async locate(messageId: number, purpose = 'a reaction', timeoutMs = LOCATE_TIMEOUT_MS): Promise<SeenMessage | null> {
     const cached = this.seen.get(messageId);
     if (cached) return cached;
     try {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const result = await withTimeout<any>(
         this.zulipClient.messages.getById({ message_id: messageId, apply_markdown: false }),
-        LOCATE_TIMEOUT_MS,
+        timeoutMs,
         `GET message ${messageId}`,
       );
       assertApiSuccess(result, `message ${messageId}`);
@@ -352,6 +381,27 @@ export class ZulipAdapter implements PlatformAdapter {
     } catch (err) {
       console.error(`[zulip-mcp] could not resolve message ${messageId} for ${purpose}:`, (err as Error).message);
       return null;
+    }
+  }
+
+  /** Reuse the mention path, but never infer addressing from a silent mention.
+   *  Check at most the first two distinct targets per incoming message within
+   *  a shared three-second budget per message. Multiple quote replies in a poll
+   *  batch can delay later events by up to that budget for each message;
+   *  prefer cached authors, otherwise one GET per target, failing closed. */
+  private async markQuoteMention(m: ZulipMessage): Promise<void> {
+    if (m.mentioned || this.identity.selfUserId === null) return;
+    const deadline = performance.now() + QUOTE_TIMEOUT_MS;
+    for (const id of quotedMessageIds(m.rawContent)) {
+      const remaining = deadline - performance.now();
+      if (remaining <= 0) return;
+      const quoted = await this.locate(id, 'a quote reply', remaining);
+      if (quoted?.authorId === this.identity.selfUserId) {
+        m.mentioned = true;
+        const cached = this.seen.get(m.id);
+        if (cached) cached.mentioned = true;
+        return;
+      }
     }
   }
 
@@ -853,7 +903,7 @@ export class ZulipAdapter implements PlatformAdapter {
           });
         }
       : undefined;
-    this.eventLoop.start(this.zulipClient, (_streamName, msg, flags) => {
+    this.eventLoop.start(this.zulipClient, async (_streamName, msg, flags) => {
       const m = normalizeMessage({ ...(msg as ZulipRawMessage), flags });
       // Remember our own messages too: reactions to them are the ones that
       // matter most ("someone reacted to your message").
@@ -869,6 +919,7 @@ export class ZulipAdapter implements PlatformAdapter {
         return;
       }
       if (m.streamName !== null && !this.filters.streamAllowed(m.streamName)) return;
+      await this.markQuoteMention(m);
       // A stream the bot joined after startup is unknown to the host; the
       // message proves it is reachable, so it travels with its descriptor
       // (#20). Sent with EVERY message, never suppressed as "already

@@ -376,8 +376,8 @@ export function toIncoming(
     metadata: {
       senderEmail: m.authorEmail,
       topic: m.topic,
-      // Zulip's server-computed flag: personal or user-group mention of the
-      // bot. Wildcards (@all/@everyone) deliberately don't count.
+      // Personal/user-group mention, or a live quote reply to the bot's own
+      // message. Wildcards (@all/@everyone) deliberately don't count.
       mentioned: m.mentioned,
       isDM: m.isDm,
       botUserId: identity.selfUserId !== null ? String(identity.selfUserId) : identity.sessionId,
