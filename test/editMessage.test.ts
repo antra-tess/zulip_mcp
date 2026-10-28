@@ -94,11 +94,43 @@ test('edit_message reports the status and a safe snippet for HTML HTTP errors', 
   }
 });
 
+test('edit_message redacts credentials interleaved with markup before truncating diagnostics', async () => {
+  const auth = Buffer.from('test@example.com:test-key').toString('base64');
+  const fragments = [auth.slice(0, 8), auth.slice(8), 'test@', 'example.com', 'test-', 'key'];
+  const f = await fixture(
+    `<html>Service unavailable: Basic <b>${fragments[0]}</b><i>${fragments[1]}</i> ` +
+    `<b>test@</b><i>example.com</i> <b>test-</b><i>key</i></html>`, 503,
+  );
+  try {
+    await assert.rejects(f.tools.handleToolCall('edit_message', { message_id: 42, content: 'updated' }), (error: Error) => {
+      assert.match(error.message, /HTTP 503.*Service unavailable/);
+      for (const fragment of fragments) assert.ok(!error.message.includes(fragment), 'no credential fragment survives');
+      assert.match(error.message, /Service unavailable: \[redacted\] \[redacted\] \[redacted\]$/);
+      return true;
+    });
+  } finally {
+    await f.close();
+  }
+});
+
 test('edit_message rejects missing or non-string content without making a request', async () => {
   const f = await fixture({ result: 'success', msg: '' });
   try {
     for (const args of [{ message_id: 42 }, ...[null, 123, false, {}].map(content => ({ message_id: 42, content }))]) {
       await assert.rejects(f.tools.handleToolCall('edit_message', args), /^Error: content is required$/);
+      assert.deepEqual(f.calls, []);
+    }
+  } finally {
+    await f.close();
+  }
+});
+
+test('edit_message rejects missing or invalid message_id without making a request', async () => {
+  const f = await fixture({ result: 'success', msg: '' });
+  try {
+    const invalid = [undefined, null, 0, -1, 1.5, '42', false, NaN, Infinity, {}];
+    for (const message_id of invalid) {
+      await assert.rejects(f.tools.handleToolCall('edit_message', { message_id, content: 'updated' }), /^Error: message_id is required$/);
       assert.deepEqual(f.calls, []);
     }
   } finally {
