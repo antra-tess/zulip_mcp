@@ -705,18 +705,38 @@ export class ZulipToolRuntime {
       }
 
       case "edit_message": {
-        if (typeof args.content !== "string") throw new Error("content is required");
         if (!Number.isInteger(args.message_id) || args.message_id <= 0) throw new Error("message_id is required");
+        if (args.content !== undefined && typeof args.content !== "string") throw new Error("content must be a string");
+        if (args.topic !== undefined && typeof args.topic !== "string") throw new Error("topic must be a string");
+        if (args.stream_id !== undefined && (!Number.isInteger(args.stream_id) || args.stream_id <= 0)) {
+          throw new Error("stream_id must be a positive integer");
+        }
+        if (args.propagate_mode !== undefined && !["change_one", "change_later", "change_all"].includes(args.propagate_mode)) {
+          throw new Error("propagate_mode must be change_one, change_later, or change_all");
+        }
+        if (args.content === undefined && args.topic === undefined && args.stream_id === undefined) {
+          throw new Error("At least one of content, topic, or stream_id is required");
+        }
+        if (args.content !== undefined && args.stream_id !== undefined) {
+          throw new Error("a stream move cannot be combined with a content edit; send two calls");
+        }
+        if (args.propagate_mode !== undefined && args.topic === undefined && args.stream_id === undefined) {
+          throw new Error("propagate_mode requires topic or stream_id");
+        }
         // zulip-js includes message_id in the query and sends no PATCH body.
         // Keep the id only in the path, with the exposed edit fields in the body.
         if (!this.session.realm || !this.session.authHeader) {
           throw new Error("Cannot edit messages: realm or bot credentials are unknown");
         }
         const apiUrl = zulipClient.config?.apiURL ?? `${this.session.realm}/api/v1`;
+        const editFields = new URLSearchParams();
+        for (const field of ["content", "topic", "propagate_mode", "stream_id"]) {
+          if (args[field] !== undefined) editFields.set(field, String(args[field]));
+        }
         const response = await fetch(`${apiUrl}/messages/${encodeURIComponent(args.message_id)}`, {
           method: "PATCH",
           headers: { Authorization: this.session.authHeader },
-          body: new URLSearchParams({ content: args.content }),
+          body: editFields,
         });
         const body = await response.text();
         let result: any = null;

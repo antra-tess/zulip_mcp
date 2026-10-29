@@ -1,0 +1,1 @@
+- `edit_message` accepts optional `topic`, `stream_id`, and `propagate_mode` to rename or move topics. Content is optional when a topic or destination stream is given; Zulip enforces realm permissions and edit limits.
