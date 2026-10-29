@@ -251,7 +251,7 @@ export const toolDefinitions: ToolDefinition[] = [
   },
   {
     name: "edit_message",
-    description: "Edit the content of an existing Zulip message by ID. You can edit your own messages (subject to the realm's message-edit time limit; an expired window returns an error). Useful for maintaining a live status message: post once with send_message, then update it in place instead of flooding the topic.",
+    description: "Edit a Zulip message by ID, or rename/move a topic. Provide at least one of content, topic, or stream_id. A stream move cannot be combined with a content edit; send two calls. Zulip defaults to change_one (this message only); use change_all to rename/move the whole topic. Permissions and edit limits are determined by the realm.",
     inputSchema: {
       type: "object",
       properties: {
@@ -263,8 +263,22 @@ export const toolDefinitions: ToolDefinition[] = [
           type: "string",
           description: "The new message content (supports Markdown, replaces the old content entirely)",
         },
+        topic: {
+          type: "string",
+          description: "New topic name",
+        },
+        propagate_mode: {
+          type: "string",
+          enum: ["change_one", "change_later", "change_all"],
+          description: "Requires topic or stream_id. Zulip defaults to change_one (this message only); change_later moves this and later messages in the same topic; change_all renames/moves the whole topic. Omit to use the server default.",
+        },
+        stream_id: {
+          type: "integer",
+          minimum: 1,
+          description: "Destination stream ID for moving messages",
+        },
       },
-      required: ["message_id", "content"],
+      required: ["message_id"],
     },
   },
   {
