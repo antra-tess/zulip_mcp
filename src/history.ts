@@ -1,14 +1,4 @@
-/**
- * Zulip message history — one fetch shape for every reader (context
- * injection, channel-open backscroll, the reconnect sweep, and the
- * fetch_history / fetch_around tools), and one conversion from a Zulip
- * message to the MCPL incoming shape so history and live delivery render
- * identically.
- *
- * Zulip message ids are realm-global and monotonic, which is what makes them
- * usable as cursors: `after`/`before` are exclusive id bounds, and a
- * watermark is just the highest id already forwarded.
- */
+/** GET /messages sorts by message id and pages around an id `anchor`, so ids serve as cursors. */
 
 import type { ChannelDescriptor, IncomingChannelMessage, TextContent } from '@animalabs/mcpl-core';
 import { CHAT_TAGS } from '@animalabs/mcpl-core';
@@ -27,7 +17,7 @@ export interface ZulipRawMessage {
   timestamp: number;
   type: string;
   stream_id?: number;
-  /** The requesting user's flags — `mentioned` is Zulip's server-side verdict. */
+  /** `mentioned` is Zulip's server-side verdict. */
   flags?: string[];
   reactions?: { emoji_name: string; emoji_code?: string; reaction_type?: string; user_id: number }[];
   /** Unix seconds of the last content edit (content only since Zulip 10);
@@ -37,16 +27,13 @@ export interface ZulipRawMessage {
   last_moved_timestamp?: number;
 }
 
-/** One emoji reaction bucket on a message. */
 export interface ReactionSummary {
-  /** Zulip emoji name, e.g. 'thumbs_up' — the `:name:` form is what add_reaction takes. */
   name: string;
-  /** Zulip's `emoji_code`: codepoints ('1f44d') for unicode emoji, the realm emoji id otherwise. */
+  /** Zulip's `emoji_code`: a unicode emoji's codepoints ('1f44d'), a custom
+   *  emoji's id, or the name of one of Zulip's own extra emoji. */
   code?: string;
-  /** Zulip's `reaction_type`. */
   type?: string;
   count: number;
-  /** Who reacted. */
   userIds: number[];
 }
 
@@ -71,7 +58,6 @@ export function summarizeReactions(raw: ZulipRawMessage['reactions']): ReactionS
   return [...buckets.values()];
 }
 
-/** ` [reactions: :thumbs_up: x2 (incl. me), :eyes: x1]`, or '' when none. */
 export function renderReactions(reactions: ReactionSummary[], selfUserId: number | null): string {
   if (reactions.length === 0) return '';
   const parts = reactions.map((r) => `:${r.name}: x${r.count}${selfUserId !== null && r.userIds.includes(selfUserId) ? ' (incl. me)' : ''}`);
@@ -84,7 +70,6 @@ export interface ZulipRecipient {
   email: string;
 }
 
-/** The normalized, model-facing view of one message. */
 export interface ZulipMessage {
   id: number;
   streamName: string | null;
@@ -107,25 +92,19 @@ export interface ZulipMessage {
   reactions: ReactionSummary[];
   /** When the content was last edited; null when never (history fetches carry it; events do not). */
   editedAt: Date | null;
-  /** When the message was last moved to another topic or stream; null when never. */
   movedAt: Date | null;
 }
 
 export interface HistoryQuery {
-  /** Stream to read; omit for a cross-stream window (fetch_around). */
   streamName?: string;
   topic?: string;
-  /** The other parties of a DM conversation (user ids); reads that conversation instead of a stream. */
   dmUserIds?: number[];
   limit: number;
-  /** Exclusive upper id bound — page backwards from here. */
   before?: number;
-  /** Exclusive lower id bound — everything newer than here. */
   after?: number;
 }
 
 export interface HistoryPage {
-  /** Oldest first. */
   messages: ZulipMessage[];
   /** Zulip's own bound reports: whether the fetch reached the end of history in each direction. */
   foundNewest: boolean;
@@ -137,8 +116,8 @@ export const ZULIP_MAX_PAGE = 5000;
 
 /**
  * zulip-js resolves API errors as values (`{ result: 'error', code, msg }`)
- * rather than rejecting — an unknown stream would otherwise read as "no
- * messages". Turn them into thrown errors with Zulip's own wording.
+ * rather than rejecting, so an unknown stream would otherwise read as "no
+ * messages".
  */
 export function assertApiSuccess(result: unknown, what: string): void {
   const r = result as { result?: string; msg?: string; code?: string } | null | undefined;
@@ -148,12 +127,9 @@ export function assertApiSuccess(result: unknown, what: string): void {
 }
 
 /**
- * The narrow for a query. Stream and topic use the `[operator, operand]`
- * pair form. A DM conversation cannot: its operand is a list of user ids,
- * and Zulip rejects a pair whose operand is not a string ("element is not
- * a string pair") while a stringified id is read as an email ("unknown
- * user"). The `{operator, operand}` object form takes the list as is. The
- * `dm` operator needs Zulip 7.0 (June 2023).
+ * A DM conversation's operand is a list of user ids, which Zulip takes in
+ * the `{operator, operand}` object form. The `dm` operator needs Zulip 7.0
+ * (May 2023).
  */
 function narrowFor(q: Pick<HistoryQuery, 'streamName' | 'topic' | 'dmUserIds'>): unknown[] {
   const narrow: unknown[] = [];
@@ -166,19 +142,14 @@ function narrowFor(q: Pick<HistoryQuery, 'streamName' | 'topic' | 'dmUserIds'>):
   return narrow;
 }
 
-// ── Direct-message channels ──
-//
-// A DM conversation is identified by its participants other than the bot,
-// as sorted user ids: `zulip:dm:42` for a 1:1, `zulip:dm:7+42` for a group.
 // Ids, not names, because names change and ids are what the send API takes.
 
 export const DM_CHANNEL_PREFIX = 'zulip:dm:';
 
-/** The other parties of a DM (the bot excluded), sorted by id. */
 export function dmCounterparts(recipients: ZulipRecipient[], selfUserId: number | null): ZulipRecipient[] {
   const others = recipients.filter((r) => selfUserId === null || r.id !== selfUserId);
-  // A DM to oneself has no counterpart; it is its own conversation.
-  const parties = others.length > 0 ? others : recipients;
+  const noOneElse = others.length === 0;
+  const parties = noOneElse ? recipients : others;
   return [...parties].sort((a, b) => a.id - b.id);
 }
 
@@ -186,7 +157,6 @@ export function dmChannelIdFor(userIds: number[]): string {
   return DM_CHANNEL_PREFIX + [...userIds].sort((a, b) => a - b).join('+');
 }
 
-/** `zulip:dm:7+42` → [7, 42]; null for anything else. */
 export function parseDmChannelId(channelId: string): number[] | null {
   if (!channelId.startsWith(DM_CHANNEL_PREFIX)) return null;
   const ids = channelId.slice(DM_CHANNEL_PREFIX.length).split('+').map((s) => Number(s));
@@ -198,7 +168,6 @@ export function isDmChannelId(channelId: string): boolean {
   return parseDmChannelId(channelId) !== null;
 }
 
-/** The channel a message belongs to: its stream, or its DM conversation. */
 export function channelIdOf(m: ZulipMessage, selfUserId: number | null): string {
   if (m.isDm) return dmChannelIdFor(dmCounterparts(m.recipients, selfUserId).map((r) => r.id));
   return `zulip:${m.streamName ?? ''}`;
@@ -236,15 +205,10 @@ export function normalizeMessage(raw: ZulipRawMessage): ZulipMessage {
   };
 }
 
-/** ` (edited)` / ` (moved)` / both for a message changed since it was sent, else ''. */
 export function editedTrailer(m: Pick<ZulipMessage, 'editedAt' | 'movedAt'>): string {
   return `${m.editedAt ? ' (edited)' : ''}${m.movedAt ? ' (moved)' : ''}`;
 }
 
-/**
- * Fetch one page of history, oldest first. `before` and `after` are
- * exclusive; with neither the page is the newest `limit` messages.
- */
 export async function fetchHistory(zulipClient: any, q: HistoryQuery): Promise<HistoryPage> {
   const limit = Math.max(0, Math.min(ZULIP_MAX_PAGE, Math.floor(q.limit)));
   if (limit === 0) return { messages: [], foundNewest: true, foundOldest: false };
@@ -271,7 +235,6 @@ export async function fetchHistory(zulipClient: any, q: HistoryQuery): Promise<H
     num_before: numBefore,
     num_after: numAfter,
     narrow: narrowFor(q),
-    // Raw markdown so attachment refs stay textual, matching the event path.
     apply_markdown: false,
     // Exclusive cursors; 'newest' already excludes nothing real.
     include_anchor: q.after === undefined && q.before === undefined,
@@ -289,13 +252,8 @@ export async function fetchHistory(zulipClient: any, q: HistoryQuery): Promise<H
 }
 
 /**
- * A window centred on one message: the message itself plus roughly half the
- * window on either side, WITHIN the anchor's own conversation (its stream
- * and topic, or its DM). Message ids are realm-global, so without a narrow
- * Zulip would answer with the realm-wide timeline — neighbours from
- * unrelated streams, which is not "surrounding context". The anchor is
- * looked up first to learn where it lives; a message that cannot be read
- * fails loudly rather than silently widening to everything.
+ * Without a narrow Zulip answers from the bot's combined feed, so the window
+ * would hold neighbours from unrelated streams.
  */
 export async function fetchAround(zulipClient: any, messageId: number, limit: number): Promise<HistoryPage> {
   const half = Math.max(0, Math.floor(Math.min(ZULIP_MAX_PAGE, limit) / 2));
@@ -321,7 +279,6 @@ export async function fetchAround(zulipClient: any, messageId: number, limit: nu
   return { messages, foundNewest: result?.found_newest === true, foundOldest: result?.found_oldest === true };
 }
 
-/** What the adapter needs to know about itself to label its own output. */
 export interface ZulipIdentity {
   selfUserId: number | null;
   sessionId: string;
@@ -340,22 +297,14 @@ export function tagsFor(m: ZulipMessage): string[] {
   return tags;
 }
 
-/** The attachment note appended to a message's content blocks. */
 export function attachmentNote(attachments: AttachmentRef[]): TextContent | null {
   if (attachments.length === 0) return null;
-  // Reference-only by default: agent reads the note, then decides whether
-  // to call fetch_attachment to pull bytes into context.
   const lines = attachments.map(
     (a) => `- ${a.name} (${a.mimeType})${a.isImage ? ' — image, fetchable via fetch_attachment' : ''}: ${a.path}`,
   );
   return { type: 'text', text: `[attachments: ${attachments.length}]\n${lines.join('\n')}` };
 }
 
-/**
- * The MCPL incoming shape for a message on `channelId`. Used for live
- * delivery and for history handed back on channels/open (`backscroll: true`
- * in metadata marks the latter).
- */
 export function toIncoming(
   channelId: string,
   m: ZulipMessage,
@@ -391,9 +340,8 @@ export function toIncoming(
 }
 
 /**
- * The descriptor for a DM conversation. `recipientName` / `recipientId`
- * make DM addressing people-first for hosts that resolve mention tokens
- * against them; the `address` is what the send API takes.
+ * `recipientName` / `recipientId` make DM addressing people-first for hosts
+ * that resolve mention tokens against them.
  */
 export function dmDescriptor(
   counterparts: ZulipRecipient[],
@@ -411,7 +359,7 @@ export function dmDescriptor(
     metadata: {
       channelType: 'dm',
       // The host's conversation router classifies on the Slack-derived
-      // convention (is_im / is_mpim); carry both spellings.
+      // convention (is_im for a 1:1, is_mpim for a group).
       ...(single ? { is_im: true } : { is_mpim: true }),
       recipientName: single ? single.full_name : names.join(', '),
       ...(single ? { recipientId: String(single.id), recipientEmail: single.email } : {}),
