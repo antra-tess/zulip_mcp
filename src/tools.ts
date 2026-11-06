@@ -155,30 +155,30 @@ export const toolDefinitions: ToolDefinition[] = [
   {
     name: "send_message",
     description:
-      "Send a stream or direct message using 'type' and 'to' (plus 'topic' for streams), or use 'reply_to' to derive the destination. Supports attachments.",
+      "Send a stream or direct message using 'type' and 'to' (plus 'topic' for streams), or use 'reply_to' to derive the destination (optionally choose a new topic for a stream reply). Returns the sent type, channelId, and stream/topic or DM recipients alongside message IDs. Supports attachments.",
     inputSchema: {
       type: "object",
       properties: {
         type: {
-          type: "string",
-          enum: ["stream", "private"],
-          description: "'stream' or 'private' (DM). Required without reply_to; otherwise inferred, and must match if supplied.",
+          type: ["string", "null"],
+          enum: ["stream", "private", "", null],
+          description: "'stream' or 'private' (DM). Required without reply_to; otherwise inferred, and must match if supplied. Null or empty string means absent.",
         },
         to: {
-          type: "string",
-          description: "For stream: stream name. For private: comma-separated email addresses. Required without reply_to; omit with reply_to.",
+          type: ["string", "null"],
+          description: "For stream: stream name. For private: comma-separated email addresses. Required without reply_to; omit with reply_to. Null or empty string means absent.",
         },
         topic: {
-          type: "string",
-          description: "Required for streams without reply_to. Omit with reply_to.",
+          type: ["string", "null"],
+          description: "Required for streams without reply_to. With a stream reply_to, overrides only the topic; refused for a private reply_to. Null or empty string means absent, except an explicitly empty topic on a stream send without reply_to is an error.",
         },
         reply_to: {
-          type: "integer",
-          description: "Message ID to reply to using its current stream/topic or full DM recipient list. Omit to/topic; supplied destinations or unreadable IDs fail before uploads or sends. Does not quote the message.",
+          type: ["integer", "null"],
+          description: "Message ID to reply to using its current stream/topic or full DM recipient list. Omit to; topic may override a stream reply's topic only. Conflicting types, supplied to, private-reply topics or unreadable IDs fail before uploads or sends. Null or empty string means absent; 0 also means absent. Does not quote the message.",
         },
         content: {
           type: "string",
-          description: "The message content (supports Markdown). May be empty when attachments are given.",
+          description: "The message content (supports Markdown). Exact [[msg:ID]] tokens anywhere (including code) become Zulip message links; \\[[msg:ID]] sends the literal token with the backslash removed and no lookup (max 20 unescaped occurrences; unreadable IDs fail before uploads/sends). May be empty when attachments are given.",
         },
         attachments: {
           type: "array",
@@ -206,7 +206,7 @@ export const toolDefinitions: ToolDefinition[] = [
       "Send a direct message to a Zulip user, identified by full name, email, or numeric user id. To reply " +
       "to a DM you received, pass the sender's name or id (both are in the message metadata). Names are " +
       "matched exactly (case-insensitive); an ambiguous name errors and lists the candidates with their " +
-      "ids, which are always a valid address. For group DMs pass several recipients.",
+      "ids, which are always a valid address. For group DMs pass several recipients. Returns type, recipients (user IDs), and channelId alongside the existing receipt fields.",
     inputSchema: {
       type: "object",
       properties: {
@@ -253,7 +253,7 @@ export const toolDefinitions: ToolDefinition[] = [
   },
   {
     name: "edit_message",
-    description: "Edit the content of an existing Zulip message by ID. You can edit your own messages (subject to the realm's message-edit time limit; an expired window returns an error). Useful for maintaining a live status message: post once with send_message, then update it in place instead of flooding the topic.",
+    description: "Edit the content of your own Zulip messages by ID (subject to the realm's message-edit time limit; an expired window returns an error). Useful for maintaining a live status message: post once with send_message, then update it in place instead of flooding the topic. Use move_messages to rename topics or move messages.",
     inputSchema: {
       type: "object",
       properties: {
@@ -263,10 +263,28 @@ export const toolDefinitions: ToolDefinition[] = [
         },
         content: {
           type: "string",
-          description: "The new message content (supports Markdown, replaces the old content entirely)",
+          description: "The new message content (supports Markdown, replaces the old content entirely). Exact [[msg:ID]] tokens anywhere (including code) become Zulip message links; \\[[msg:ID]] sends the literal token with the backslash removed and no lookup (max 20 unescaped occurrences; unreadable IDs fail without editing).",
         },
       },
       required: ["message_id", "content"],
+    },
+  },
+  {
+    name: "move_messages",
+    description: "Rename a topic or move Zulip messages by message ID. Provide topic or stream_id. Zulip defaults to change_one (this message only); use change_all for the whole topic. Realm permissions and move time limits apply, including to other people's messages. Use list_streams to find a destination stream_id. Content edits use edit_message separately. Zulip posts a Notification Bot breadcrumb in the destination topic by default. To resolve a topic, rename it to ✔ <topic> with change_all. After a cross-stream move, confirm with send_message using moved_to.stream and moved_to.topic, not channels/publish (the destination channel may have a newer conversation). If a later channel publish is refused, nothing was posted: reply with send_message({reply_to: <messageId>, content}).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        message_id: { type: "number", description: "ID of the message to move" },
+        topic: { type: ["string", "null"], description: "New topic name" },
+        stream_id: { type: ["integer", "null"], minimum: 1, description: "Destination stream ID" },
+        propagate_mode: {
+          type: "string",
+          enum: ["change_one", "change_later", "change_all"],
+          description: "Requires topic or stream_id. Zulip defaults to change_one (this message only); change_later moves this and later messages in the same topic; change_all renames/moves the whole topic. Omit to use the server default.",
+        },
+      },
+      required: ["message_id"],
     },
   },
   {
